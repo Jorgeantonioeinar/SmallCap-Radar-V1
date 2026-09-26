@@ -324,65 +324,87 @@ def _diag_result(name, configured, status, code=None, latency=None, detail=''):
     return {"source":name,"configured":bool(configured),"status":status,"http":code,"latency_sec":round(latency,2) if latency is not None else None,"detail":detail}
 
 def diagnose_sources(config):
-    """Fast, bounded health checks. Never returns secrets."""
+    """Endpoint-level health checks. Never returns API keys or authorization headers."""
     out=[]
+    http=HTTP(timeout=12,min_interval=0.35)
+
+    def detail_from_response(r):
+        if r is None:
+            return ''
+        if getattr(r,'status_code',0) < 400:
+            return 'Endpoint respondió correctamente'
+        try:
+            j=r.json()
+            if isinstance(j,dict):
+                return str(j.get('message') or j.get('error') or j.get('detail') or j.get('errorMessage') or j)[:320]
+            return str(j)[:320]
+        except Exception:
+            return (getattr(r,'text','') or '')[:320].replace('\n',' ')
+
     def check(name, configured, fn):
         if not configured:
-            out.append(_diag_result(name,False,'MISSING',detail='API key/credential not configured'))
+            out.append(_diag_result(name,False,'MISSING',detail='Credencial no configurada en Streamlit Secrets'))
             return
         t=time.time()
         try:
             r=fn()
             elapsed=time.time()-t
             code=getattr(r,'status_code',200)
-            if isinstance(r, requests.Response):
-                detail=''
-                if code>=400:
-                    try:
-                        j=r.json(); detail=str(j.get('message') or j.get('error') or j.get('detail') or j)[:240]
-                    except Exception: detail=r.text[:240].replace('\n',' ')
-                out.append(_diag_result(name,True,'OK' if code<400 else 'ERROR',code,elapsed,detail))
-            else:
-                out.append(_diag_result(name,True,'OK',200,elapsed,''))
+            out.append(_diag_result(name,True,'OK' if code < 400 else 'ERROR',code,elapsed,detail_from_response(r)))
         except requests.HTTPError as e:
-            resp=getattr(e,'response',None); code=getattr(resp,'status_code',None)
-            detail=''
-            if resp is not None:
-                try:
-                    j=resp.json(); detail=str(j.get('message') or j.get('error') or j.get('detail') or j)[:240]
-                except Exception: detail=resp.text[:240].replace('\n',' ')
-            out.append(_diag_result(name,True,'ERROR',code,time.time()-t,detail))
+            resp=getattr(e,'response',None)
+            code=getattr(resp,'status_code',None)
+            out.append(_diag_result(name,True,'ERROR',code,time.time()-t,detail_from_response(resp) or f'{type(e).__name__}: HTTP error'))
         except Exception as e:
-            out.append(_diag_result(name,True,'ERROR',None,time.time()-t,f'{type(e).__name__}: {e}'[:240]))
+            out.append(_diag_result(name,True,'ERROR',None,time.time()-t,f'{type(e).__name__}: {e}'[:320]))
 
-    http=HTTP(min_interval=0.25)
+    def now_window():
+        end=datetime.now(UTC)
+        start=end-timedelta(hours=6)
+        return start.isoformat().replace('+00:00','Z'),end.isoformat().replace('+00:00','Z')
+
     akey=config.get('ALPACA_API_KEY'); asec=config.get('ALPACA_SECRET_KEY')
     paper=str(config.get('ALPACA_PAPER','True')).lower() in {'true','1','yes','on'}
     ahead={'APCA-API-KEY-ID':akey,'APCA-API-SECRET-KEY':asec}
     atrading=Alpaca.TRADING_PAPER if paper else Alpaca.TRADING_LIVE
-    check('Alpaca Trading',bool(akey and asec),lambda: http.request('GET',f'{atrading}/account',headers=ahead,retries=0))
-    check('Alpaca Market Data',bool(akey and asec),lambda: http.request('GET',f'{Alpaca.DATA}/v2/stocks/snapshots',headers=ahead,params={'symbols':'AAPL','feed':'iex'},retries=0))
-    check('Alpaca Bars',bool(akey and asec),lambda: http.request('GET',f'{Alpaca.DATA}/v2/stocks/bars',headers=ahead,params={'symbols':'AAPL','timeframe':'1Min','limit':5,'feed':'iex','adjustment':'raw'},retries=0))
+    check('Alpaca Trading /account',bool(akey and asec),lambda: http.request('GET',f'{atrading}/account',headers=ahead,retries=0))
+    check('Alpaca Snapshot /v2/stocks/snapshots',bool(akey and asec),lambda: http.request('GET',f'{Alpaca.DATA}/v2/stocks/snapshots',headers=ahead,params={'symbols':'AAPL','feed':'iex'},retries=0))
+    astart,aend=now_window()
+    check('Alpaca Bars /v2/stocks/bars',bool(akey and asec),lambda: http.request('GET',f'{Alpaca.DATA}/v2/stocks/bars',headers=ahead,params={'symbols':'AAPL','timeframe':'1Min','start':astart,'end':aend,'limit':50,'feed':'iex','adjustment':'raw'},retries=0))
 
     mkey=config.get('MASSIVE_API_KEY')
-    check('Massive',bool(mkey),lambda: http.request('GET',f'{Massive.BASE}/v3/reference/tickers/AAPL',params={'apiKey':mkey},retries=0))
+    check('Massive Reference /v3/reference/tickers',bool(mkey),lambda: http.request('GET',f'{Massive.BASE}/v3/reference/tickers/AAPL',params={'apiKey':mkey},retries=0))
+    check('Massive Full Snapshot /v2/snapshot',bool(mkey),lambda: http.request('GET',f'{Massive.BASE}/v2/snapshot/locale/us/markets/stocks/tickers',params={'apiKey':mkey,'include_otc':'false'},retries=0))
+    ms,e=now_window()
+    check('Massive 1m Bars /v2/aggs',bool(mkey),lambda: http.request('GET',f'{Massive.BASE}/v2/aggs/ticker/AAPL/range/1/minute/{datetime.fromisoformat(ms.replace("Z","+00:00")).date()}/{datetime.fromisoformat(e.replace("Z","+00:00")).date()}',params={'adjusted':'true','sort':'asc','limit':10,'apiKey':mkey},retries=0))
+
     fkey=config.get('FMP_API_KEY')
-    check('FMP',bool(fkey),lambda: http.request('GET',f'{FMP.BASE}/profile',params={'symbol':'AAPL','apikey':fkey},retries=0))
+    check('FMP Profile /stable/profile',bool(fkey),lambda: http.request('GET',f'{FMP.BASE}/profile',params={'symbol':'AAPL','apikey':fkey},retries=0))
+    check('FMP Screener /stable/company-screener',bool(fkey),lambda: http.request('GET',f'{FMP.BASE}/company-screener',params={'priceMoreThan':1,'priceLowerThan':20,'volumeMoreThan':100000,'exchange':'NASDAQ,NYSE,AMEX','country':'US','isEtf':'false','isFund':'false','isActivelyTrading':'true','limit':5,'apikey':fkey},retries=0))
+
     hkey=config.get('FINNHUB_API_KEY')
-    check('Finnhub',bool(hkey),lambda: http.request('GET',f'{Finnhub.BASE}/quote',params={'symbol':'AAPL','token':hkey},retries=0))
+    check('Finnhub Quote /quote',bool(hkey),lambda: http.request('GET',f'{Finnhub.BASE}/quote',params={'symbol':'AAPL','token':hkey},retries=0))
+    check('Finnhub Profile /stock/profile2',bool(hkey),lambda: http.request('GET',f'{Finnhub.BASE}/stock/profile2',params={'symbol':'AAPL','token':hkey},retries=0))
+    check('Finnhub News /company-news',bool(hkey),lambda: http.request('GET',f'{Finnhub.BASE}/company-news',params={'symbol':'AAPL','from':(datetime.now(UTC)-timedelta(days=2)).date().isoformat(),'to':datetime.now(UTC).date().isoformat(),'token':hkey},retries=0))
+
     tkey=config.get('TWELVE_DATA_API_KEY')
-    check('Twelve Data',bool(tkey),lambda: http.request('GET',f'{TwelveData.BASE}/quote',params={'symbol':'AAPL','apikey':tkey},retries=0))
+    check('Twelve Data /quote',bool(tkey),lambda: http.request('GET',f'{TwelveData.BASE}/quote',params={'symbol':'AAPL','apikey':tkey},retries=0))
+
     ua=config.get('SEC_USER_AGENT','')
-    check('SEC EDGAR',bool(ua and 'contact@example.com' not in ua),lambda: http.request('GET','https://data.sec.gov/submissions/CIK0000320193.json',headers={'User-Agent':ua,'Accept-Encoding':'gzip, deflate'},retries=0))
-    check('Nasdaq Halts',True,lambda: http.request('GET','https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts',retries=0))
+    sec_ok=bool(ua and '@' in ua and 'tudominio.com' not in ua.lower() and 'example.com' not in ua.lower())
+    check('SEC EDGAR /submissions',sec_ok,lambda: http.request('GET','https://data.sec.gov/submissions/CIK0000320193.json',headers={'User-Agent':ua,'Accept-Encoding':'gzip, deflate'},retries=0))
+
+    check('Nasdaq Halts /tradehalts RSS',True,lambda: http.request('GET','https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts',retries=0))
+
     ofkey=config.get('OPENFDA_API_KEY')
-    check('OpenFDA',bool(ofkey),lambda: http.request('GET','https://api.fda.gov/drug/drugsfda.json',params={'api_key':ofkey,'limit':1},retries=0))
-    # FINRA is a public context source; a tiny request is enough to detect access/schema errors.
+    check('OpenFDA /drugsfda',bool(ofkey),lambda: http.request('GET','https://api.fda.gov/drug/drugsfda.json',params={'api_key':ofkey,'limit':1},retries=0))
+
     def finra_req():
         payload={'limit':1,'fields':['tradeReportDate','securitiesInformationProcessorSymbolIdentifier','shortParQuantity','totalParQuantity']}
         return http.request('POST','https://api.finra.org/data/group/otcMarket/name/regShoDaily',json=payload,retries=0)
-    check('FINRA Reg SHO',True,finra_req)
+    check('FINRA Reg SHO /otcMarket',True,finra_req)
     return out
+
 
 def scan(config,min_price,max_price,min_gap,min_dv,max_float,max_candidates,manual,coverage='Multi-source'):
     started=time.time(); key=config.get('ALPACA_API_KEY'); secret=config.get('ALPACA_SECRET_KEY')

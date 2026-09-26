@@ -1,1 +1,1 @@
-Small Cap Radar V1.1 Multi-source
+Small Cap Radar V1.1.2 Endpoint Diagnostics

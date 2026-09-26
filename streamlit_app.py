@@ -47,8 +47,8 @@ with st.sidebar:
     st.caption("No hacemos scraping. Puedes exportar el screener desde cada servicio y subir el CSV aquí.")
     tv_file=st.file_uploader("CSV de TradingView o Finviz",type=['csv'],key='external_csv')
     st.info("V1.1 no envía órdenes. Validamos primero datos y señales en Paper Trading.")
-    refresh=st.button("🔄 ESCANEAR AHORA",type='primary',use_container_width=True)
-    diagnose=st.button("🩺 DIAGNÓSTICO DE APIs",use_container_width=True,help="Prueba cada fuente con una consulta pequeña y muestra HTTP, latencia y causa del error sin revelar claves.")
+    refresh=st.button("🔄 ESCANEAR AHORA",type='primary',width="stretch")
+    diagnose=st.button("🩺 DIAGNÓSTICO DE APIs",width="stretch",help="Prueba cada fuente con una consulta pequeña y muestra HTTP, latencia y causa del error sin revelar claves.")
 
 if not cfg['ALPACA_API_KEY'] or not cfg['ALPACA_SECRET_KEY']:
     st.error("Faltan ALPACA_API_KEY y ALPACA_SECRET_KEY en Streamlit → Manage app → Settings → Secrets.")
@@ -63,13 +63,13 @@ if diagnose:
 
 if 'api_diag' in st.session_state:
     st.subheader('🩺 Diagnóstico de APIs')
-    st.caption('Prueba rápida de conectividad. No muestra ni registra las claves. OK significa que el endpoint de prueba respondió correctamente; no garantiza que todos los endpoints del proveedor estén incluidos en tu plan.')
+    st.caption('Diagnóstico por endpoint: prueba exactamente las rutas que el Radar necesita para discovery, snapshots, barras y enriquecimiento. No muestra ni registra las claves.')
     diag=pd.DataFrame(st.session_state.api_diag)
     if not diag.empty:
         diag['Resultado']=diag.apply(lambda r: '🟢 OK' if r['status']=='OK' else ('🟡 FALTA CLAVE' if r['status']=='MISSING' else '🔴 ERROR'),axis=1)
         diag['HTTP']=diag['http'].apply(lambda x: int(x) if pd.notna(x) else '—')
         diag['Latencia']=diag['latency_sec'].apply(lambda x: f"{float(x):.2f}s" if pd.notna(x) else '—')
-        st.dataframe(diag[['source','Resultado','HTTP','Latencia','detail']].rename(columns={'source':'Fuente','detail':'Detalle'}),use_container_width=True,hide_index=True)
+        st.dataframe(diag[['source','Resultado','HTTP','Latencia','detail']].rename(columns={'source':'Fuente','detail':'Detalle'}),width="stretch",hide_index=True)
         errors=diag[diag['status'].isin(['ERROR','MISSING'])]
         if not errors.empty:
             st.warning('Hay fuentes que todavía no están listas. Corrige primero las que aparecen aquí; después vuelve a ejecutar el diagnóstico.')
@@ -133,7 +133,7 @@ for c in num4:
 for c in num1:
     if c in view:
         view[c]=pd.to_numeric(view[c],errors='coerce').round(1)
-st.dataframe(view,use_container_width=True,hide_index=True)
+st.dataframe(view,width="stretch",hide_index=True)
 
 st.subheader('🔎 Ficha del candidato')
 sym=st.selectbox('Ticker',df.symbol.tolist());r=df[df.symbol==sym].iloc[0]
