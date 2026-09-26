@@ -319,6 +319,71 @@ def _news_score(items,sym):
     return max(-5,min(5,sc)),len(hits),hits[0] if hits else ('','')
 
 
+
+def _diag_result(name, configured, status, code=None, latency=None, detail=''):
+    return {"source":name,"configured":bool(configured),"status":status,"http":code,"latency_sec":round(latency,2) if latency is not None else None,"detail":detail}
+
+def diagnose_sources(config):
+    """Fast, bounded health checks. Never returns secrets."""
+    out=[]
+    def check(name, configured, fn):
+        if not configured:
+            out.append(_diag_result(name,False,'MISSING',detail='API key/credential not configured'))
+            return
+        t=time.time()
+        try:
+            r=fn()
+            elapsed=time.time()-t
+            code=getattr(r,'status_code',200)
+            if isinstance(r, requests.Response):
+                detail=''
+                if code>=400:
+                    try:
+                        j=r.json(); detail=str(j.get('message') or j.get('error') or j.get('detail') or j)[:240]
+                    except Exception: detail=r.text[:240].replace('\n',' ')
+                out.append(_diag_result(name,True,'OK' if code<400 else 'ERROR',code,elapsed,detail))
+            else:
+                out.append(_diag_result(name,True,'OK',200,elapsed,''))
+        except requests.HTTPError as e:
+            resp=getattr(e,'response',None); code=getattr(resp,'status_code',None)
+            detail=''
+            if resp is not None:
+                try:
+                    j=resp.json(); detail=str(j.get('message') or j.get('error') or j.get('detail') or j)[:240]
+                except Exception: detail=resp.text[:240].replace('\n',' ')
+            out.append(_diag_result(name,True,'ERROR',code,time.time()-t,detail))
+        except Exception as e:
+            out.append(_diag_result(name,True,'ERROR',None,time.time()-t,f'{type(e).__name__}: {e}'[:240]))
+
+    http=HTTP(min_interval=0.25)
+    akey=config.get('ALPACA_API_KEY'); asec=config.get('ALPACA_SECRET_KEY')
+    paper=str(config.get('ALPACA_PAPER','True')).lower() in {'true','1','yes','on'}
+    ahead={'APCA-API-KEY-ID':akey,'APCA-API-SECRET-KEY':asec}
+    atrading=Alpaca.TRADING_PAPER if paper else Alpaca.TRADING_LIVE
+    check('Alpaca Trading',bool(akey and asec),lambda: http.request('GET',f'{atrading}/account',headers=ahead,retries=0))
+    check('Alpaca Market Data',bool(akey and asec),lambda: http.request('GET',f'{Alpaca.DATA}/v2/stocks/snapshots',headers=ahead,params={'symbols':'AAPL','feed':'iex'},retries=0))
+    check('Alpaca Bars',bool(akey and asec),lambda: http.request('GET',f'{Alpaca.DATA}/v2/stocks/bars',headers=ahead,params={'symbols':'AAPL','timeframe':'1Min','limit':5,'feed':'iex','adjustment':'raw'},retries=0))
+
+    mkey=config.get('MASSIVE_API_KEY')
+    check('Massive',bool(mkey),lambda: http.request('GET',f'{Massive.BASE}/v3/reference/tickers/AAPL',params={'apiKey':mkey},retries=0))
+    fkey=config.get('FMP_API_KEY')
+    check('FMP',bool(fkey),lambda: http.request('GET',f'{FMP.BASE}/profile',params={'symbol':'AAPL','apikey':fkey},retries=0))
+    hkey=config.get('FINNHUB_API_KEY')
+    check('Finnhub',bool(hkey),lambda: http.request('GET',f'{Finnhub.BASE}/quote',params={'symbol':'AAPL','token':hkey},retries=0))
+    tkey=config.get('TWELVE_DATA_API_KEY')
+    check('Twelve Data',bool(tkey),lambda: http.request('GET',f'{TwelveData.BASE}/quote',params={'symbol':'AAPL','apikey':tkey},retries=0))
+    ua=config.get('SEC_USER_AGENT','')
+    check('SEC EDGAR',bool(ua and 'contact@example.com' not in ua),lambda: http.request('GET','https://data.sec.gov/submissions/CIK0000320193.json',headers={'User-Agent':ua,'Accept-Encoding':'gzip, deflate'},retries=0))
+    check('Nasdaq Halts',True,lambda: http.request('GET','https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts',retries=0))
+    ofkey=config.get('OPENFDA_API_KEY')
+    check('OpenFDA',bool(ofkey),lambda: http.request('GET','https://api.fda.gov/drug/drugsfda.json',params={'api_key':ofkey,'limit':1},retries=0))
+    # FINRA is a public context source; a tiny request is enough to detect access/schema errors.
+    def finra_req():
+        payload={'limit':1,'fields':['tradeReportDate','securitiesInformationProcessorSymbolIdentifier','shortParQuantity','totalParQuantity']}
+        return http.request('POST','https://api.finra.org/data/group/otcMarket/name/regShoDaily',json=payload,retries=0)
+    check('FINRA Reg SHO',True,finra_req)
+    return out
+
 def scan(config,min_price,max_price,min_gap,min_dv,max_float,max_candidates,manual,coverage='Multi-source'):
     started=time.time(); key=config.get('ALPACA_API_KEY'); secret=config.get('ALPACA_SECRET_KEY')
     if not key or not secret: raise RuntimeError('Faltan ALPACA_API_KEY y ALPACA_SECRET_KEY.')
