@@ -97,12 +97,18 @@ class HTTP:
 
 class AlpacaMarket:
     BASE = "https://data.alpaca.markets/v2"
-    TRADING = "https://api.alpaca.markets/v2"
 
-    def __init__(self, key: str, secret: str, http: Optional[HTTP] = None):
+    def __init__(self, key: str, secret: str, paper: bool = True, http: Optional[HTTP] = None):
         self.key, self.secret = key, secret
+        self.paper = bool(paper)
         self.http = http or HTTP()
         self.headers = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
+        # Alpaca Trading API uses a DIFFERENT domain for Paper vs Live.
+        # Market Data remains on data.alpaca.markets for both environments.
+        self.TRADING = (
+            "https://paper-api.alpaca.markets/v2"
+            if self.paper else "https://api.alpaca.markets/v2"
+        )
 
     def assets(self) -> List[dict]:
         return self.http.get_json(

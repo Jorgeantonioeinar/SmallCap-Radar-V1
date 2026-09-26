@@ -25,6 +25,7 @@ def secret(name, default=""):
 cfg={
     "ALPACA_API_KEY": secret("ALPACA_API_KEY"),
     "ALPACA_SECRET_KEY": secret("ALPACA_SECRET_KEY"),
+    "ALPACA_PAPER": secret("ALPACA_PAPER", "True"),
     "FMP_API_KEY": secret("FMP_API_KEY"),
     "TWELVE_DATA_API_KEY": secret("TWELVE_DATA_API_KEY"),
     "SEC_USER_AGENT": secret("SEC_USER_AGENT", "SmallCapRadar/1.0 contact@example.com"),
@@ -33,6 +34,8 @@ cfg={
 st.markdown("""<style>.block-container{max-width:100%;padding-top:1rem}.metric-card{padding:.8rem;border:1px solid #333;border-radius:.6rem}</style>""",unsafe_allow_html=True)
 st.title("⚡ Small Cap Radar V1.0")
 st.caption("Gap + momentum + catalyst + dilution/SEC risk + halts + data confidence · Scanner only")
+paper_mode = str(cfg["ALPACA_PAPER"]).strip().lower() in {"true", "1", "yes", "on"}
+st.info(f"Alpaca Trading API: {'PAPER' if paper_mode else 'LIVE'} · Market Data: IEX")
 
 if not cfg["ALPACA_API_KEY"] or not cfg["ALPACA_SECRET_KEY"]:
     st.warning("Configura ALPACA_API_KEY y ALPACA_SECRET_KEY en Streamlit Cloud → Settings → Secrets. No pongas las claves en GitHub.")
