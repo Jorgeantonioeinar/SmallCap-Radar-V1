@@ -1,9 +1,12 @@
-# Small Cap Radar V1.0 — GitHub + Streamlit Cloud
+# Small Cap Radar V1.0.2 — GitHub + Streamlit Cloud
 
 Esta versión parte del proyecto `smallcaps_bot_v6_sincobertura` y añade un camino **cloud-first** para validar el radar antes de activar cualquier ejecución.
 
-## Qué hace V1.0
+## Qué hace V1.0.2
 - Universo dinámico de acciones US activas desde Alpaca.
+- Descubrimiento primero con los screeners oficiales de Alpaca (movers + most-active), y snapshots IEX solo para candidatos.
+- Control de ritmo de llamadas, reintentos ante 429/5xx y respeto de `Retry-After`.
+- Fallback controlado de 500 símbolos (Rápido) o 1.000 (Amplio) si el screener no responde; nunca se consulta todo el universo de miles de símbolos en un solo barrido.
 - Snapshots IEX para filtrar por precio, gap y volumen en dólares.
 - Deep scan 1-min de los candidatos: VWAP, PMH/PML, HOD, EMA 9/20/50, RSI, ATR, ADX, Bollinger, aceleración de precio/volumen.
 - SEC EDGAR: filings recientes asociados a posible financiación/dilución.

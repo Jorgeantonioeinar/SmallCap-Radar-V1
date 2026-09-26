@@ -79,36 +79,81 @@ class Candidate:
 
 
 class HTTP:
-    def __init__(self, timeout: int = 12):
+    """Small HTTP client with bounded retry/backoff for cloud APIs.
+
+    A 429 is not treated as a fatal application error. We honor Retry-After
+    when present and otherwise use exponential backoff. This is important on
+    Streamlit Cloud where a user can click Scan repeatedly.
+    """
+    def __init__(self, timeout: int = 15, min_interval: float = 0.0):
         self.timeout = timeout
+        self.min_interval = float(min_interval)
+        self._last_request = 0.0
         self.s = requests.Session()
-        self.s.headers.update({"User-Agent": "SmallCapRadar/1.0 contact@example.com"})
+        self.s.headers.update({"User-Agent": "SmallCapRadar/1.0 (Streamlit Cloud)"})
 
-    def get_json(self, url: str, headers: Optional[dict] = None, params: Optional[dict] = None) -> Any:
-        r = self.s.get(url, headers=headers, params=params, timeout=self.timeout)
-        r.raise_for_status()
-        return r.json()
+    def _pace(self):
+        if self.min_interval <= 0:
+            return
+        wait = self.min_interval - (time.monotonic() - self._last_request)
+        if wait > 0:
+            time.sleep(wait)
 
-    def get_text(self, url: str, headers: Optional[dict] = None, params: Optional[dict] = None) -> str:
-        r = self.s.get(url, headers=headers, params=params, timeout=self.timeout)
-        r.raise_for_status()
-        return r.text
+    def _request(self, method: str, url: str, headers: Optional[dict] = None,
+                 params: Optional[dict] = None, retries: int = 4) -> requests.Response:
+        last = None
+        for attempt in range(retries + 1):
+            self._pace()
+            try:
+                r = self.s.request(method, url, headers=headers, params=params, timeout=self.timeout)
+                self._last_request = time.monotonic()
+                if r.status_code == 429:
+                    if attempt >= retries:
+                        raise requests.HTTPError(
+                            f"429 Too Many Requests after {retries + 1} attempts: {url}", response=r
+                        )
+                    retry_after = r.headers.get("Retry-After")
+                    try:
+                        delay = float(retry_after) if retry_after else 2.0 ** attempt
+                    except ValueError:
+                        delay = 2.0 ** attempt
+                    # Never sleep indefinitely in Streamlit.
+                    time.sleep(min(max(delay, 1.0), 20.0))
+                    last = r
+                    continue
+                if r.status_code in (500, 502, 503, 504) and attempt < retries:
+                    time.sleep(min(2.0 ** attempt, 8.0))
+                    last = r
+                    continue
+                r.raise_for_status()
+                return r
+            except requests.RequestException as exc:
+                last = exc
+                if attempt >= retries:
+                    raise
+                time.sleep(min(2.0 ** attempt, 8.0))
+        raise RuntimeError(f"HTTP request failed: {url}") from last
+
+    def get_json(self, url: str, headers: Optional[dict] = None,
+                 params: Optional[dict] = None) -> Any:
+        return self._request("GET", url, headers=headers, params=params).json()
+
+    def get_text(self, url: str, headers: Optional[dict] = None,
+                 params: Optional[dict] = None) -> str:
+        return self._request("GET", url, headers=headers, params=params).text
 
 
 class AlpacaMarket:
-    BASE = "https://data.alpaca.markets/v2"
+    DATA = "https://data.alpaca.markets"
 
     def __init__(self, key: str, secret: str, paper: bool = True, http: Optional[HTTP] = None):
         self.key, self.secret = key, secret
         self.paper = bool(paper)
-        self.http = http or HTTP()
+        # One request every ~0.40s keeps the free 200 historical/data-call RPM
+        # ceiling from being hammered by repeated Streamlit scans.
+        self.http = http or HTTP(min_interval=0.40)
         self.headers = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
-        # Alpaca Trading API uses a DIFFERENT domain for Paper vs Live.
-        # Market Data remains on data.alpaca.markets for both environments.
-        self.TRADING = (
-            "https://paper-api.alpaca.markets/v2"
-            if self.paper else "https://api.alpaca.markets/v2"
-        )
+        self.TRADING = "https://paper-api.alpaca.markets/v2" if self.paper else "https://api.alpaca.markets/v2"
 
     def assets(self) -> List[dict]:
         return self.http.get_json(
@@ -117,12 +162,27 @@ class AlpacaMarket:
             params={"status": "active", "asset_class": "us_equity"},
         )
 
+    def movers(self, top: int = 50) -> dict:
+        return self.http.get_json(
+            f"{self.DATA}/v1beta1/screener/stocks/movers",
+            headers=self.headers,
+            params={"top": max(1, min(50, int(top)))},
+        )
+
+    def most_active(self, top: int = 100) -> dict:
+        return self.http.get_json(
+            f"{self.DATA}/v1beta1/screener/stocks/most-actives",
+            headers=self.headers,
+            params={"top": max(1, min(100, int(top))), "by": "volume"},
+        )
+
     def snapshots(self, symbols: List[str]) -> Dict[str, dict]:
+        """Fetch only the candidate set, not the entire US universe."""
         out: Dict[str, dict] = {}
         for i in range(0, len(symbols), 100):
-            chunk = symbols[i:i+100]
+            chunk = symbols[i:i + 100]
             data = self.http.get_json(
-                f"{self.BASE}/stocks/snapshots",
+                f"{self.DATA}/v2/stocks/snapshots",
                 headers=self.headers,
                 params={"symbols": ",".join(chunk), "feed": "iex"},
             )
@@ -138,7 +198,7 @@ class AlpacaMarket:
             "end": end.astimezone(UTC).isoformat().replace("+00:00", "Z"),
             "limit": 10000, "feed": "iex", "adjustment": "raw",
         }
-        data = self.http.get_json(f"{self.BASE}/stocks/bars", headers=self.headers, params=params)
+        data = self.http.get_json(f"{self.DATA}/v2/stocks/bars", headers=self.headers, params=params)
         result = {}
         for sym, rows in (data.get("bars") or {}).items():
             result[sym] = pd.DataFrame(rows)
@@ -146,6 +206,23 @@ class AlpacaMarket:
 
     def clock(self) -> dict:
         return self.http.get_json(f"{self.TRADING}/clock", headers=self.headers)
+
+    @staticmethod
+    def _extract_symbols(payload: Any) -> List[str]:
+        """Handle minor response-shape changes in Alpaca screener endpoints."""
+        symbols = []
+        def walk(x):
+            if isinstance(x, dict):
+                for k, v in x.items():
+                    if k.lower() in {"symbol", "ticker"} and isinstance(v, str):
+                        symbols.append(v.upper())
+                    else:
+                        walk(v)
+            elif isinstance(x, list):
+                for v in x:
+                    walk(v)
+        walk(payload)
+        return list(dict.fromkeys(s for s in symbols if re.fullmatch(r"[A-Z]{1,5}", s)))
 
 
 class PublicSources:
@@ -388,83 +465,168 @@ def _confidence(c: Candidate) -> float:
     return round(sum(w for ok,w in zip(checks,weights) if ok)/sum(weights)*100,1)
 
 
-def scan(config: dict, min_price: float, max_price: float, min_gap: float, min_dollar_volume: float, max_float: float, max_candidates: int, manual: List[str]) -> Tuple[pd.DataFrame, dict]:
+def _asset_map(assets: List[dict]) -> Dict[str, dict]:
+    exchanges = {"NYSE", "NASDAQ", "AMEX", "ARCA", "NYSEARCA"}
+    out = {}
+    for a in assets:
+        sym = str(a.get("symbol", "")).upper()
+        if not a.get("tradable") or a.get("status") != "active":
+            continue
+        if a.get("exchange") not in exchanges:
+            continue
+        if not re.fullmatch(r"[A-Z]{1,5}", sym):
+            continue
+        out[sym] = a
+    return out
+
+
+def _discover_candidate_symbols(alp: AlpacaMarket, assets_map: Dict[str, dict], manual: List[str], top: int = 50) -> Tuple[List[str], dict]:
+    """Use Alpaca's dedicated screener first; never snapshot the whole universe by default."""
+    discovered: List[str] = []
+    methods = []
+    try:
+        discovered += alp._extract_symbols(alp.movers(top))
+        methods.append("movers")
+    except Exception:
+        pass
+    try:
+        discovered += alp._extract_symbols(alp.most_active(100))
+        methods.append("most_active")
+    except Exception:
+        pass
+    # Manual symbols always get priority if they are in the eligible universe.
+    for sym in manual:
+        if sym.upper() in assets_map:
+            discovered.insert(0, sym.upper())
+    discovered = list(dict.fromkeys(s for s in discovered if s in assets_map))
+    return discovered, {"discovery_methods": methods, "discovery_count": len(discovered)}
+
+
+def scan(config: dict, min_price: float, max_price: float, min_gap: float,
+         min_dollar_volume: float, max_float: float, max_candidates: int,
+         manual: List[str], coverage_mode: str = "Rápido") -> Tuple[pd.DataFrame, dict]:
     if not config.get("ALPACA_API_KEY") or not config.get("ALPACA_SECRET_KEY"):
         raise RuntimeError("Faltan ALPACA_API_KEY y/o ALPACA_SECRET_KEY.")
-    http = HTTP()
-    alp = AlpacaMarket(config["ALPACA_API_KEY"], config["ALPACA_SECRET_KEY"], http)
-    pub = PublicSources(http, config.get("SEC_USER_AGENT") or "SmallCapRadar contact@example.com")
+    paper = str(config.get("ALPACA_PAPER", "True")).strip().lower() in {"true", "1", "yes", "on"}
+    http = HTTP(min_interval=0.40)
+    alp = AlpacaMarket(config["ALPACA_API_KEY"], config["ALPACA_SECRET_KEY"], paper, http)
+    pub = PublicSources(http, config.get("SEC_USER_AGENT") or "SmallCapRadar/1.0 contact@example.com")
     started = time.time()
+
     assets = alp.assets()
-    allowed = []
-    exchanges = {"NYSE","NASDAQ","AMEX","ARCA"}
-    for a in assets:
-        if not a.get("tradable") or a.get("status") != "active" or a.get("exchange") not in exchanges: continue
-        sym = a.get("symbol","")
-        if re.fullmatch(r"[A-Z]{1,5}", sym): allowed.append(sym)
-    # Dynamic universe: snapshots first, then deep scan only top candidates.
-    snaps = alp.snapshots(allowed)
-    rows=[]
-    for sym, s in snaps.items():
-        tr=s.get("latestTrade") or {}; q=s.get("latestQuote") or {}; day=s.get("dailyBar") or {}; prev=s.get("prevDailyBar") or {}
-        price=float(tr.get("p") or day.get("c") or 0); prevc=float(prev.get("c") or 0); vol=float(day.get("v") or 0)
-        if not price or not prevc: continue
-        gap=(price/prevc-1)*100
-        dv=price*vol
-        if price < min_price or price > max_price or gap < min_gap or dv < min_dollar_volume: continue
-        bid=float(q.get("bp") or 0) or None; ask=float(q.get("ap") or 0) or None
-        spread=((ask-bid)/price*100) if bid and ask and price else None
-        rows.append((sym,price,prevc,gap,vol,dv,bid,ask,spread))
-    rows.sort(key=lambda x:(x[3],x[5]), reverse=True)
-    if manual:
-        have={r[0] for r in rows}
-        manual_snaps={k:v for k,v in snaps.items() if k in {m.upper() for m in manual}}
-        for sym,s in manual_snaps.items():
-            tr=s.get("latestTrade") or {}; day=s.get("dailyBar") or {}; prev=s.get("prevDailyBar") or {}; q=s.get("latestQuote") or {}
-            price=float(tr.get("p") or day.get("c") or 0); prevc=float(prev.get("c") or 0)
-            if price and prevc and sym not in have:
-                rows.append((sym,price,prevc,(price/prevc-1)*100,float(day.get("v") or 0),price*float(day.get("v") or 0),float(q.get("bp") or 0) or None,float(q.get("ap") or 0) or None,None))
-    rows=rows[:max_candidates]
-    symbols=[r[0] for r in rows]
-    now=datetime.now(NY); start=now.replace(hour=4,minute=0,second=0,microsecond=0)
-    bars=alp.bars(symbols,start,now)
-    news=pub.news(); halts=pub.halt_symbols(); sec=pub.sec_events(symbols)
-    fmp_key=config.get("FMP_API_KEY")
-    fmp_profiles={}
+    amap = _asset_map(assets)
+
+    discovery_error = ""
+    try:
+        discovered, discovery_meta = _discover_candidate_symbols(alp, amap, manual, 50)
+    except Exception as exc:
+        discovered, discovery_meta = [], {"discovery_methods": [], "discovery_count": 0}
+        discovery_error = str(exc)
+
+    # Optional broad mode: if the dedicated screener is unavailable, use only a
+    # controlled subset of assets rather than hammering thousands of snapshots.
+    if len(discovered) < 10:
+        # Fail-soft fallback. We deliberately sample the eligible universe rather
+        # than request snapshots for every asset, which is what caused the 429
+        # in the previous build.
+        universe = list(amap.keys())
+        cap = 1000 if coverage_mode == "Amplio" else 500
+        if universe:
+            step = max(1, len(universe) // cap)
+            sampled = universe[::step][:cap]
+            discovered = list(dict.fromkeys(discovered + sampled))
+            discovery_meta["discovery_methods"] = list(dict.fromkeys(discovery_meta.get("discovery_methods", []) + ["controlled_asset_fallback"]))
+            discovery_meta["discovery_count"] = len(discovered)
+
+    if not discovered and manual:
+        raise RuntimeError("Los tickers manuales no aparecen como activos elegibles en Alpaca.")
+    if not discovered:
+        raise RuntimeError("Alpaca no devolvió candidatos del screener. Prueba nuevamente en unos segundos.")
+
+    snaps = alp.snapshots(discovered)
+    rows = []
+    for sym in discovered:
+        s = snaps.get(sym) or {}
+        tr = s.get("latestTrade") or {}; q = s.get("latestQuote") or {}
+        day = s.get("dailyBar") or {}; prev = s.get("prevDailyBar") or {}
+        price = float(tr.get("p") or day.get("c") or 0)
+        prevc = float(prev.get("c") or 0)
+        vol = float(day.get("v") or 0)
+        if not price or not prevc:
+            continue
+        gap = (price / prevc - 1) * 100
+        dv = price * vol
+        if price < min_price or price > max_price or gap < min_gap or dv < min_dollar_volume:
+            continue
+        bid = float(q.get("bp") or 0) or None; ask = float(q.get("ap") or 0) or None
+        spread = ((ask - bid) / price * 100) if bid and ask and price else None
+        rows.append((sym, price, prevc, gap, vol, dv, bid, ask, spread))
+
+    # Gap first, then liquidity. This is the discovery ranking, not a trade signal.
+    rows.sort(key=lambda x: (x[3], x[5]), reverse=True)
+    rows = rows[:max_candidates]
+    symbols = [r[0] for r in rows]
+    now = datetime.now(NY)
+    start = now.replace(hour=4, minute=0, second=0, microsecond=0)
+    bars = alp.bars(symbols, start, now)
+
+    news = pub.news()
+    halts = pub.halt_symbols()
+    sec = pub.sec_events(symbols)
+
+    fmp_key = config.get("FMP_API_KEY")
+    fmp_profiles = {}
     if fmp_key:
         for sym in symbols[:15]:
             try:
-                j=http.get_json("https://financialmodelingprep.com/api/v3/profile/"+sym,params={"apikey":fmp_key})
-                if j: fmp_profiles[sym]=j[0]
-            except Exception: pass
-    out=[]
+                j = http.get_json("https://financialmodelingprep.com/api/v3/profile/" + sym, params={"apikey": fmp_key})
+                if j:
+                    fmp_profiles[sym] = j[0]
+            except Exception:
+                pass
+
+    out = []
     for r in rows:
-        sym,price,prevc,gap,vol,dv,bid,ask,spread=r
-        c=Candidate(sym,price,prevc,gap,vol,dv,bid=bid,ask=ask,spread_pct=spread)
-        prof=fmp_profiles.get(sym,{})
-        c.float_shares=float(prof.get("floatShares")) if prof.get("floatShares") else None
-        c.shares_outstanding=float(prof.get("sharesOutstanding")) if prof.get("sharesOutstanding") else None
-        c.market_cap=float(prof.get("mktCap")) if prof.get("mktCap") else None
-        if c.float_shares and c.float_shares>max_float: continue
-        f=_bar_features(bars.get(sym,pd.DataFrame()),now)
-        for k,v in f.items():
-            if hasattr(c,k): setattr(c,k,v)
-        c.catalyst_score,c.catalyst_count,c.catalyst_text,c.catalyst_url=PublicSources.news_for_symbol(news,sym)
-        se=sec.get(sym,{})
-        c.sec_risk_score=float(se.get("risk",0)); c.sec_flags=se.get("flags","")
-        if sym in halts: c.halt=True; c.halt_reason=halts[sym]
-        # RVOL proxy using current daily volume versus the average daily volume in FMP when available.
+        sym, price, prevc, gap, vol, dv, bid, ask, spread = r
+        c = Candidate(sym, price, prevc, gap, vol, dv, bid=bid, ask=ask, spread_pct=spread)
+        prof = fmp_profiles.get(sym, {})
+        c.float_shares = float(prof.get("floatShares")) if prof.get("floatShares") else None
+        c.shares_outstanding = float(prof.get("sharesOutstanding")) if prof.get("sharesOutstanding") else None
+        c.market_cap = float(prof.get("mktCap")) if prof.get("mktCap") else None
+        if c.float_shares and c.float_shares > max_float:
+            continue
+        f = _bar_features(bars.get(sym, pd.DataFrame()), now)
+        for k, v in f.items():
+            if hasattr(c, k):
+                setattr(c, k, v)
+        c.catalyst_score, c.catalyst_count, c.catalyst_text, c.catalyst_url = PublicSources.news_for_symbol(news, sym)
+        se = sec.get(sym, {})
+        c.sec_risk_score = float(se.get("risk", 0)); c.sec_flags = se.get("flags", "")
+        if sym in halts:
+            c.halt = True; c.halt_reason = halts[sym]
         if prof.get("volAvg"):
-            avg=float(prof["volAvg"]); c.rvol=vol/avg if avg else None
+            avg = float(prof["volAvg"]); c.rvol = vol / avg if avg else None
         elif c.intraday_rvol is not None:
-            c.rvol=c.intraday_rvol
-        c.data_confidence=_confidence(c); c.score=_score(c); c.setup=_setup(c)
-        if price>0:
-            atr=c.atr or price*.02
-            c.stop=round(max(0.01,price-1.2*atr),4); c.tp1=round(price*1.03,4); c.tp2=round(price*1.06,4)
-            c.entry_zone=f"{price*.995:.4f}–{price*1.005:.4f}"
-        c.source_notes="Alpaca IEX + SEC + Nasdaq halts + GlobeNewswire/PR Newswire" + (" + FMP" if fmp_key else "")
+            c.rvol = c.intraday_rvol
+        c.data_confidence = _confidence(c); c.score = _score(c); c.setup = _setup(c)
+        atr = c.atr or price * .02
+        c.stop = round(max(0.01, price - 1.2 * atr), 4)
+        c.tp1 = round(price * 1.03, 4); c.tp2 = round(price * 1.06, 4)
+        c.entry_zone = f"{price*.995:.4f}–{price*1.005:.4f}"
+        c.source_notes = "Alpaca screener + IEX snapshots/bars + SEC + Nasdaq halts + GlobeNewswire/PR Newswire" + (" + FMP" if fmp_key else "")
         out.append(c)
-    out.sort(key=lambda x:x.score,reverse=True)
-    meta={"universe_assets":len(allowed),"snapshot_candidates":len(rows),"final_candidates":len(out),"elapsed_sec":round(time.time()-started,2),"source_status":{"alpaca":True,"sec":bool(sec),"news":bool(news),"halts":bool(halts),"fmp":bool(fmp_key)}}
+    out.sort(key=lambda x: x.score, reverse=True)
+    meta = {
+        "universe_assets": len(amap),
+        "discovery_candidates": len(discovered),
+        "snapshot_candidates": len(rows),
+        "final_candidates": len(out),
+        "elapsed_sec": round(time.time() - started, 2),
+        "source_status": {"alpaca": True, "sec": bool(sec), "news": bool(news), "halts": bool(halts), "fmp": bool(fmp_key)},
+        "discovery_methods": discovery_meta.get("discovery_methods", []),
+        "discovery_error": discovery_error,
+        "coverage_mode": coverage_mode,
+        "rate_limit_strategy": "0.40s pacing + Retry-After/exponential backoff; candidate-only snapshots",
+    }
     return pd.DataFrame([c.to_dict() for c in out]), meta
+
