@@ -100,10 +100,17 @@ if df.empty:
 st.subheader('🎯 Radar multi-fuente')
 cols=['symbol','name','exchange','price','gap_pct','volume','rvol','intraday_rvol','volume_accel','spread_pct','float_shares','market_cap','vwap','pmh','rsi','adx','catalyst_score','sec_risk_score','short_volume_ratio','clinical_hits','fda_hits','data_confidence','score','setup']
 view=df[[c for c in cols if c in df.columns]].copy()
-for c in ['price','vwap','pmh','stop','tp1','tp2']:
-    if c in view:view[c]=view[c].round(4)
-for c in ['gap_pct','spread_pct','catalyst_score','sec_risk_score','short_volume_ratio','data_confidence','score']:
-    if c in view:view[c]=view[c].round(1)
+# Streamlit/Pandas can receive mixed-type columns when a provider returns
+# missing values, text, or a failed API response. Normalize numeric fields
+# before rounding so one bad value cannot crash the whole radar.
+num4=['price','vwap','pmh','stop','tp1','tp2']
+num1=['gap_pct','spread_pct','catalyst_score','sec_risk_score','short_volume_ratio','data_confidence','score']
+for c in num4:
+    if c in view:
+        view[c]=pd.to_numeric(view[c],errors='coerce').round(4)
+for c in num1:
+    if c in view:
+        view[c]=pd.to_numeric(view[c],errors='coerce').round(1)
 st.dataframe(view,use_container_width=True,hide_index=True)
 
 st.subheader('🔎 Ficha del candidato')
