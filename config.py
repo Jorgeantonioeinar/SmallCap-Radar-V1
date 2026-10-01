@@ -99,13 +99,25 @@ ALPHAVANTAGE_API_KEY = _get_secret("ALPHAVANTAGE_API_KEY", "")
 FINNHUB_API_KEY = _get_secret("FINNHUB_API_KEY", "")
 TWELVE_DATA_API_KEY = _get_secret("TWELVE_DATA_API_KEY", "")
 
+# Massive (antes Polygon.io) — plan gratis: llamadas ilimitadas pero datos
+# RETRASADOS 15 minutos. Por eso solo se usa como ÚLTIMO respaldo de precio
+# (nunca como fuente primaria) y como fuente extra de Market Cap/Shares.
+MASSIVE_API_KEY = _get_secret("MASSIVE_API_KEY", "") or _get_secret("POLYGON_API_KEY", "")
+MASSIVE_REST_BASE_URL = "https://api.massive.com"
+
+# Tiingo — plan gratis: SOLO EOD (cierre diario) y fundamentales, sin tiempo
+# real (eso requiere el add-on de pago "BOATS"). Se usa como respaldo de
+# Previous Close y como otra fuente más de Float/Shares/Market Cap.
+TIINGO_API_KEY = _get_secret("TIINGO_API_KEY", "")
+TIINGO_REST_BASE_URL = "https://api.tiingo.com"
+
 # ---------------------------------------------------------------------------
 # SCANNER AUTOMÁTICO (Top 30 gappers/spikes vía TradingView -> Finviz)
 # ---------------------------------------------------------------------------
 SCANNER_PRICE_MIN = 0.50
 SCANNER_PRICE_MAX = 30.0
 SCANNER_MAX_MARKET_CAP = 2_000_000_000   # $2B
-SCANNER_MIN_VOLUME = 500_000
+SCANNER_MIN_VOLUME = 500_000  # regular: mínimo razonable; Moomoo alineado a 500K
 SCANNER_MIN_CHANGE_PCT = 5.0
 
 FLOAT_CACHE_FILE = "float_cache.csv"       # caché local (símbolo, float, fecha)
@@ -128,7 +140,8 @@ MANUAL_TICKERS_FILE = "manual_tickers.txt"
 # mercado completo (plan gratuito). Puedes ampliarla con tus propios tickers
 # frecuentes de small caps.
 DEFAULT_WATCHLIST = [
-    "AAPL",  # ejemplo - reemplaza por tus small caps habituales
+    # Vacío a propósito: en Manual solo se usan tickers importados/pegados.
+    # (Antes tenía "AAPL" y en modo Manual salía solo Apple si el import fallaba.)
 ]
 
 
@@ -139,13 +152,13 @@ PRICE_MIN = 0.01
 PRICE_MAX = 30.0
 
 GAP_MIN_PCT = 15.0          # variación mínima pre-market / del día (%)
-PREMARKET_VOLUME_MIN = 500_000
+PREMARKET_VOLUME_MIN = 300_000  # PM: menos liquidez estructural; 300K evita perder gaps buenos
 
 FLOAT_MIN_SHARES = 1_000_000      # por debajo de esto: demasiado ilíquido/manipulable, se descarta
-FLOAT_MAX_SHARES = 10_000_000     # float máximo aceptado (antes 20M)
-FLOAT_LOW_BONUS_SHARES = 8_000_000   # por debajo de esto, bonus de score
+FLOAT_MAX_SHARES = 12_000_000     # float máximo aceptado (V7.6.6: más flexible, era 10M)
+FLOAT_LOW_BONUS_SHARES = 12_000_000  # por debajo de esto, bonus de score (era 8M)
 
-RVOL_MIN = 3.0               # volumen relativo mínimo para considerar el ticker
+RVOL_MIN = 3.0               # baseline regular; perfiles por sesión pueden bajar/subir
 
 RSI_PERIOD = 14
 RSI_OVERBOUGHT = 80          # por encima de esto, penaliza (riesgo de "backside")
@@ -217,7 +230,9 @@ TRADING_WINDOW_END_ET = "13:00"
 # ---------------------------------------------------------------------------
 SCORE_MIN_TO_BUY = 9.0       # a partir de esta calificación (escala 1-10) se
                               # considera señal de COMPRA en largo
-TOP_N_CANDIDATOS = 20         # cuántos candidatos mostrar en el ranking
+TOP_N_CANDIDATOS = 20         # ranking automático; watchlist manual muestra TODOS
+# _RANK_LIMIT_OVERRIDE se setea en runtime (0 = todos)
+
 
 
 # ---------------------------------------------------------------------------
@@ -368,3 +383,137 @@ TRADE_JOURNAL_FILE = "trade_journal.csv"
 PREMARKET_START = "04:00"
 MARKET_OPEN = "09:30"
 MARKET_CLOSE = "16:00"
+
+# ---------------------------------------------------------------------------
+# V7.1 — DATA QUALITY & HALT ENGINE
+# ---------------------------------------------------------------------------
+# Si data_confidence < este umbral, el screener degrada COMPRA_LARGO → VIGILAR.
+DATA_CONFIDENCE_MIN_FOR_BUY = 70
+
+# Halt Engine (Nasdaq Trader RSS, gratis, sin API key)
+HALT_ENGINE_ENABLED = True
+
+
+# ---------------------------------------------------------------------------
+# V7.4 — TRES PERFILES DE SCORING POR SESIÓN (Premarket / Regular / After-Hours)
+# ---------------------------------------------------------------------------
+# Cada sesión de la bolsa US tiene liquidez, volumen y comportamiento distintos.
+# El scoring y la señal "LISTO" usan umbrales propios de la sesión activa.
+#
+# session_mode en UI / runtime:
+#   "auto"       — detecta premarket | regular | afterhours | closed con el reloj NY
+#   "premarket"  — fuerza reglas premarket (cazar gaps 4:00–9:30)
+#   "regular"    — fuerza reglas regular (9:30–16:00), sub-ventana fuerte 9:30–11:00
+#   "afterhours" — fuerza reglas AH (16:00–20:00)
+#   "off"        — sin filtro horario (usa umbrales "regular" pero no bloquea por hora)
+#
+SESSION_SCORING_PROFILES = {
+    "premarket": {
+        "label": "🌅 Premarket (4:00–9:30 ET)",
+        "gap_min_pct": 10.0,          # gaps más tempranos; 10% ya es interesante
+        "rvol_min": 2.0,              # PM: RVOL clásico moderado; prioriza float turnover
+        "score_min_listo": 9.0,       # Quality mínimo para LISTO
+        "entry_min_listo": 6.5,       # Entry un poco más flexible (PMH/retest)
+        "confidence_min": 65,         # datos extended a veces incompletos en free
+        "prefer_float_turnover": True,
+        "notes": "Cazar gaps/spikes con menos volumen; tamaño de posición ya reducido en SESSION_RISK.",
+    },
+    "regular": {
+        "label": "🔔 Regular (9:30–16:00 ET)",
+        "gap_min_pct": 15.0,
+        "rvol_min": 3.0,
+        "score_min_listo": 9.0,
+        "entry_min_listo": 7.0,
+        "confidence_min": 70,
+        "prefer_float_turnover": False,
+        "strong_window_start": "09:30",
+        "strong_window_end": "11:00",
+        "notes": "Gap & go clásico; primera hora es la ventana más fuerte.",
+    },
+    "afterhours": {
+        "label": "🌙 After-Hours (16:00–20:00 ET)",
+        "gap_min_pct": 8.0,           # movimientos post-close / noticias
+        "rvol_min": 1.5,              # volumen AH es estructuralmente bajo
+        "score_min_listo": 9.3,       # más exigente: spreads anchos, menos liquidez
+        "entry_min_listo": 7.0,
+        "confidence_min": 65,
+        "prefer_float_turnover": True,
+        "notes": "Solo setups muy limpios; size pequeño (SESSION_RISK). Cuidado con spreads.",
+    },
+}
+
+# Compatibilidad V7.3
+SESSION_FILTER_ENABLED_DEFAULT = False
+SESSION_STRONG_START = "09:30"
+SESSION_STRONG_END = "11:00"
+SESSION_PREMARKET_START = "04:00"
+ENTRY_SCORE_MIN_FOR_READY = 7.0
+
+
+def get_session_scoring_profile(session: str = None) -> dict:
+    """Umbrales de scoring según sesión. session: premarket|regular|afterhours."""
+    if session is None or session == "closed":
+        session = "regular"
+    if session not in SESSION_SCORING_PROFILES:
+        session = "regular"
+    return SESSION_SCORING_PROFILES[session]
+
+# ---------------------------------------------------------------------------
+# TradeZero (ejecución opcional — NO market data)
+# ---------------------------------------------------------------------------
+TZ_API_KEY_ID = os.getenv("TZ_API_KEY_ID", "")
+TZ_API_SECRET_KEY = os.getenv("TZ_API_SECRET_KEY", "") or os.getenv("TZ_API_SECRET", "")
+TZ_ACCOUNT_ID = os.getenv("TZ_ACCOUNT_ID", "")
+
+
+# ---------------------------------------------------------------------------
+# Interactive Brokers TWS — fuente PRIMARIA de market data (solo si TWS está ON)
+# Paper: puerto 7497 | Live: 7496 (no usar live por defecto)
+# En Streamlit Cloud / sin TWS → failover automático a Alpaca (ver market_data_manager)
+# ---------------------------------------------------------------------------
+IBKR_HOST = os.getenv("IBKR_HOST", "127.0.0.1")
+IBKR_PORT = int(os.getenv("IBKR_PORT", "7497"))  # 7497 = paper TWS
+IBKR_CLIENT_ID = int(os.getenv("IBKR_CLIENT_ID", "1"))
+IBKR_ACCOUNT = os.getenv("IBKR_ACCOUNT", "DUR216049")  # paper
+IBKR_CONNECT_TIMEOUT = float(os.getenv("IBKR_CONNECT_TIMEOUT", "3"))
+IBKR_ENABLED = os.getenv("IBKR_ENABLED", "true").lower() in ("1", "true", "yes")
+
+
+# ---------------------------------------------------------------------------
+# Screening modes (V7.6.5)
+# ---------------------------------------------------------------------------
+# Completo: Twelve Data PM/AH, SEC dilution, sentiment (más lento, más datos)
+# Rápido: sin Twelve Data ni SEC/news; prioritiza precio/gap/RVOL/float en caché
+FAST_SCREENING = False  # se sobreescribe en runtime desde la UI
+FAST_SCREENING_WORKERS = 4  # paralelismo en modo rápido
+
+
+# ---------------------------------------------------------------------------
+# VOLUME_FILTERS_V76 — guía operativa (Moomoo + bot)
+# ---------------------------------------------------------------------------
+# Moomoo Regular (recomendado):
+#   Volume today >= 500K
+#   Turnover   >= 1M USD
+#   Volume Ratio (si existe) >= 3
+# Moomoo Premarket:
+#   Volume >= 200K–300K (no 500K o se vacía la lista)
+#   % Chg >= 8–10%
+# Moomoo After-Hours:
+#   Volume >= 200K, % Chg >= 5–8%, no exigir RVOL alto
+#
+# Bot (interno):
+#   PREMARKET_VOLUME_MIN = 300_000
+#   SCANNER_MIN_VOLUME   = 500_000  (regular)
+#   RVOL_MIN profiles: PM 2.0 | REG 3.0 | AH 1.5
+#   LISTO exige RVOL de sesión + gap + quality (no solo volumen crudo)
+VOLUME_FILTERS_V76 = True
+
+
+# ---------------------------------------------------------------------------
+# MOOMOO OPEND (solo LOCAL — Capa 1: datos; Capa 2: órdenes)
+# ---------------------------------------------------------------------------
+MOOMOO_OPEND_HOST = _get_secret("MOOMOO_OPEND_HOST", "127.0.0.1")
+MOOMOO_OPEND_PORT = int(_get_secret("MOOMOO_OPEND_PORT", "11111") or "11111")
+# SIMULATE = paper (por defecto). REAL solo cuando operes capital.
+MOOMOO_TRD_ENV = _get_secret("MOOMOO_TRD_ENV", "SIMULATE").upper()  # SIMULATE | REAL
+MOOMOO_ENABLED = _get_secret("MOOMOO_ENABLED", "True") == "True"

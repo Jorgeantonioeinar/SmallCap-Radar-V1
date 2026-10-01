@@ -219,8 +219,10 @@ class TitonSmartEngine:
         catalyst_verified = data.get("catalyst_verified")
         sec_dilution_blocked = data.get("sec_dilution_blocked", False)
 
-        gap_pct = None
-        if price and prev_close and prev_close > 0:
+        # Una lectura importada del screener (p. ej. Moomoo Pre Mkt % Chg)
+        # es preferible al cálculo con cotizaciones de otra sesión/feed.
+        gap_pct = data.get("gap_pct")
+        if gap_pct is None and price and prev_close and prev_close > 0:
             gap_pct = ((price - prev_close) / prev_close) * 100
 
         result = {

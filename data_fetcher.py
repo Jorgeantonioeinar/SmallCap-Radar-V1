@@ -31,6 +31,13 @@ import config
 logger = logging.getLogger("data_fetcher")
 
 
+# Market data: IBKR TWS (primario local) → Alpaca (failover nube/sin TWS)
+try:
+    from market_data_manager import get_market_data_manager
+except Exception:
+    get_market_data_manager = None
+
+
 class DataFetcher:
     def __init__(self):
         if not config.ALPACA_API_KEY or not config.ALPACA_SECRET_KEY:
@@ -53,9 +60,12 @@ class DataFetcher:
 
         # Cache simple en memoria para no golpear yfinance repetidamente
         self._fundamentals_cache = {}
+        self._float_cache_ts = {}  # symbol -> epoch; reusar float varios minutos
         self._yahoo_disabled_until = 0.0  # circuit breaker por tiempo (epoch seconds), no permanente
         self._finviz_disabled_until = 0.0
         self._twelvedata_disabled_until = 0.0
+        self._massive_disabled_until = 0.0
+        self._tiingo_disabled_until = 0.0
 
         # Feed de streaming en tiempo real (opcional). Se conecta desde
         # fuera con set_realtime_feed() - normalmente en main.py cuando
@@ -63,6 +73,7 @@ class DataFetcher:
         # configura, get_latest_price() sigue funcionando 100% con REST.
         self.realtime_feed = None
         self._fmp_disabled = False
+        self._alpaca_disabled_until = 0.0
 
     def set_realtime_feed(self, feed):
         """Conecta un RealtimeFeed (realtime_feed.py) como fuente principal de precio."""
@@ -125,6 +136,24 @@ class DataFetcher:
     # ------------------------------------------------------------------
     def get_bars(self, symbol: str, minutes_back: int = 60, timeframe=TimeFrame.Minute):
         """Devuelve un DataFrame con barras recientes (OHLCV) de Alpaca."""
+        if time.time() < getattr(self, "_alpaca_disabled_until", 0):
+            return pd.DataFrame()
+        # Preferir barras IBKR (o Alpaca vía MDM) si el manager está activo
+        if get_market_data_manager is not None:
+            try:
+                mdm = get_market_data_manager()
+                minutes = 390
+                try:
+                    import config as _cfg
+                    minutes = int(getattr(_cfg, "LOOKBACK_MINUTES_FALLBACK", 390))
+                except Exception:
+                    pass
+                bdf = mdm.get_bars(symbol, minutes_back=minutes)
+                if bdf is not None and not bdf.empty:
+                    return bdf
+            except Exception as _mdm_e:
+                logger.debug(f"MDM bars skip {symbol}: {_mdm_e}")
+
         end = datetime.now(timezone.utc)
         start = end - timedelta(minutes=minutes_back * 2)  # margen extra
 
@@ -145,53 +174,201 @@ class DataFetcher:
                 df = df.xs(symbol, level=0)
             return df.tail(minutes_back)
         except Exception as e:
-            logger.warning(f"[{symbol}] Error obteniendo barras de Alpaca: {e}")
+            msg = str(e).lower()
+            if "too many requests" in msg or "429" in msg:
+                self._alpaca_disabled_until = time.time() + 90
+                logger.warning("Alpaca rate limit (bars) — pausa 90s")
+            else:
+                logger.warning(f"[{symbol}] Error obteniendo barras de Alpaca: {e}")
             return pd.DataFrame()
 
     def get_latest_price(self, symbol: str):
-        """
-        Cadena de redundancia para el precio:
-          1. WebSocket en tiempo real (si está conectado y el dato es reciente)
-          2. REST de Alpaca (latest quote) - lo de siempre
-          3. Último dato del WebSocket aunque esté "viejo" (stale) - último recurso
-        """
-        # --- 1) WebSocket (fuente principal, si está activo) ---
-        if self.realtime_feed is not None:
-            cached = self.realtime_feed.get_latest(symbol, max_age_seconds=15)
-            if cached and cached.get("price") is not None and not cached["stale"]:
-                return cached["price"]
+        """Precio: MDM/IBKR → realtime → Alpaca IEX → Yahoo (si Alpaca 429)."""
+        if time.time() < getattr(self, "_alpaca_disabled_until", 0):
+            # No golpear Alpaca; ir directo a Yahoo
+            return self._yahoo_last_price(symbol)
 
-        # --- 2) REST de Alpaca (respaldo 1) ---
+        # Market data manager (IBKR/Alpaca unificado) si existe
+        if get_market_data_manager is not None:
+            try:
+                mdm = get_market_data_manager()
+                px = mdm.get_latest_price(symbol)
+                if px is not None:
+                    return float(px)
+            except Exception as _mdm_e:
+                logger.debug(f"MDM price skip {symbol}: {_mdm_e}")
+
+        # Stream en memoria
+        try:
+            if self.realtime_feed is not None:
+                cached = self.realtime_feed.get_last(symbol)
+                if cached and cached.get("price") is not None and not cached.get("stale"):
+                    return cached["price"]
+        except Exception:
+            pass
+
+        # Alpaca REST
         try:
             req = StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=DataFeed.IEX)
             response = self.data_client.get_stock_latest_quote(req)
-            if symbol not in response:
-                logger.warning(
-                    f"[{symbol}] Sin cotización en el feed IEX (probable ticker OTC o no cubierto "
-                    f"por este feed gratuito, no es un error de credenciales)."
-                )
-                raise KeyError(symbol)
-            quote = response[symbol]
-            # Usamos el punto medio entre bid/ask como precio de referencia
-            if quote.bid_price and quote.ask_price:
-                return (quote.bid_price + quote.ask_price) / 2
-            return quote.ask_price or quote.bid_price
-        except KeyError:
-            pass  # ya se logueó arriba con un mensaje claro
+            quote = response.get(symbol) if isinstance(response, dict) else None
+            if quote is None and hasattr(response, "__getitem__"):
+                try:
+                    quote = response[symbol]
+                except Exception:
+                    quote = None
+            if quote is not None:
+                if getattr(quote, "bid_price", None) and getattr(quote, "ask_price", None):
+                    return (quote.bid_price + quote.ask_price) / 2
+                return quote.ask_price or quote.bid_price
         except Exception as e:
-            logger.warning(f"[{symbol}] Error obteniendo cotización REST: {e}")
+            msg = str(e).lower()
+            if "too many requests" in msg or "429" in msg:
+                self._alpaca_disabled_until = time.time() + 90
+                logger.warning("Alpaca rate limit (quote) — pausa 90s; se usa Yahoo")
+            else:
+                logger.warning(f"[{symbol}] Error obteniendo cotización REST: {e}")
 
-        # --- 3) Caché vieja del WebSocket (respaldo 2, último recurso) ---
-        if self.realtime_feed is not None:
-            cached = self.realtime_feed.get_latest(symbol, max_age_seconds=15)
-            if cached and cached.get("price") is not None:
-                logger.info(
-                    f"[{symbol}] REST falló, usando último precio del WebSocket "
-                    f"(tiene {cached['age_seconds']}s de antigüedad)"
-                )
-                return cached["price"]
+        # Yahoo fallback (gratis, un poco más lento pero evita tabla vacía)
+        return self._yahoo_last_price(symbol)
 
+
+
+    def _yahoo_last_price(self, symbol: str):
+        """Respaldo de precio vía yfinance cuando Alpaca está limitado."""
+        try:
+            t = yf.Ticker(symbol)
+            fi = getattr(t, "fast_info", None)
+            if fi is not None:
+                for key in ("last_price", "lastPrice", "regular_market_price"):
+                    try:
+                        v = fi.get(key) if hasattr(fi, "get") else getattr(fi, key, None)
+                        if v is not None and float(v) > 0:
+                            return float(v)
+                    except Exception:
+                        pass
+            hist = t.history(period="1d", interval="1m")
+            if hist is not None and not hist.empty:
+                return float(hist["Close"].iloc[-1])
+            hist = t.history(period="5d")
+            if hist is not None and not hist.empty:
+                return float(hist["Close"].iloc[-1])
+        except Exception as e:
+            logger.debug(f"[{symbol}] Yahoo price falló: {e}")
         return None
+
+    def get_massive_last_price(self, symbol: str):
+        """
+        Último recurso de precio: Massive (antes Polygon.io), plan gratis.
+        OJO — dato RETRASADO 15 minutos. Nunca usar como fuente primaria en
+        un bot de scalping; solo sirve para no quedarse totalmente ciego en
+        un ticker que Alpaca/IEX no cubre (ej. OTC), sabiendo que el precio
+        puede estar desactualizado. Siempre se loguea como "(retrasado)"
+        para que quede claro en cualquier auditoría posterior.
+        """
+        if not config.MASSIVE_API_KEY or time.time() < self._massive_disabled_until:
+            return None
+        try:
+            url = f"{config.MASSIVE_REST_BASE_URL}/v2/last/trade/{symbol}?apiKey={config.MASSIVE_API_KEY}"
+            resp = requests.get(url, timeout=8)
+            if resp.status_code == 429:
+                self._massive_disabled_until = time.time() + 60
+                logger.warning("Massive alcanzó su límite de peticiones — se pausa 60s.")
+                return None
+            if resp.status_code != 200:
+                logger.info(f"[{symbol}] Massive devolvió status {resp.status_code}.")
+                return None
+            data = resp.json()
+            price = data.get("results", {}).get("p")
+            if price:
+                logger.info(f"[{symbol}] Precio de Massive (RETRASADO ~15min): ${price}")
+                return float(price)
+        except Exception as e:
+            logger.info(f"[{symbol}] Massive (precio) falló: {e}")
+        return None
+
+    def get_massive_reference_data(self, symbol: str) -> dict:
+        """Market Cap y Shares Outstanding vía Massive — dato de referencia, no de precio, sin el problema del retraso de 15 min."""
+        if not config.MASSIVE_API_KEY or time.time() < self._massive_disabled_until:
+            return {}
+        try:
+            url = f"{config.MASSIVE_REST_BASE_URL}/v3/reference/tickers/{symbol}?apiKey={config.MASSIVE_API_KEY}"
+            resp = requests.get(url, timeout=8)
+            if resp.status_code == 429:
+                self._massive_disabled_until = time.time() + 60
+                logger.warning("Massive alcanzó su límite de peticiones — se pausa 60s.")
+                return {}
+            if resp.status_code != 200:
+                return {}
+            results = resp.json().get("results", {})
+            out = {}
+            if results.get("market_cap"):
+                out["market_cap"] = float(results["market_cap"])
+            so = results.get("share_class_shares_outstanding") or results.get("weighted_shares_outstanding")
+            if so:
+                out["shares_outstanding"] = float(so)
+            return out
+        except Exception as e:
+            logger.info(f"[{symbol}] Massive (referencia) falló: {e}")
+            return {}
+
+    def get_tiingo_previous_close(self, symbol: str):
+        """Respaldo de Previous Close si las barras diarias de Alpaca fallan. Tiingo free = solo EOD, ideal justo para esto."""
+        if not config.TIINGO_API_KEY or time.time() < self._tiingo_disabled_until:
+            return None
+        try:
+            url = (
+                f"{config.TIINGO_REST_BASE_URL}/tiingo/daily/{symbol}/prices"
+                f"?token={config.TIINGO_API_KEY}&resampleFreq=daily"
+            )
+            resp = requests.get(url, timeout=8)
+            if resp.status_code == 429:
+                self._tiingo_disabled_until = time.time() + 60
+                logger.warning("Tiingo alcanzó su límite de peticiones — se pausa 60s.")
+                return None
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            if not data:
+                return None
+            today_utc = datetime.now(timezone.utc).date()
+            anteriores = [
+                row for row in data
+                if datetime.fromisoformat(row["date"].replace("Z", "+00:00")).date() < today_utc
+            ]
+            if not anteriores:
+                return None
+            return float(anteriores[-1]["close"])
+        except Exception as e:
+            logger.info(f"[{symbol}] Tiingo (previous close) falló: {e}")
+            return None
+
+    def get_tiingo_fundamentals(self, symbol: str) -> dict:
+        """Shares Outstanding / Market Cap vía Tiingo — otra fuente más para la cadena de Float."""
+        if not config.TIINGO_API_KEY or time.time() < self._tiingo_disabled_until:
+            return {}
+        try:
+            url = f"{config.TIINGO_REST_BASE_URL}/tiingo/fundamentals/{symbol}/daily?token={config.TIINGO_API_KEY}"
+            resp = requests.get(url, timeout=8)
+            if resp.status_code == 429:
+                self._tiingo_disabled_until = time.time() + 60
+                logger.warning("Tiingo alcanzó su límite de peticiones — se pausa 60s.")
+                return {}
+            if resp.status_code != 200:
+                return {}
+            data = resp.json()
+            if not data:
+                return {}
+            latest = data[-1] if isinstance(data, list) else data
+            out = {}
+            if latest.get("marketCap"):
+                out["market_cap"] = float(latest["marketCap"])
+            if latest.get("sharesOutstanding") or latest.get("shares_outstanding"):
+                out["shares_outstanding"] = float(latest.get("sharesOutstanding") or latest.get("shares_outstanding"))
+            return out
+        except Exception as e:
+            logger.info(f"[{symbol}] Tiingo (fundamentales) falló: {e}")
+            return {}
 
     def get_quote_spread_pct(self, symbol: str):
         """
@@ -243,7 +420,7 @@ class DataFetcher:
             )
             daily = self.data_client.get_stock_bars(req).df
             if daily.empty:
-                return None
+                raise ValueError("Alpaca no devolvió barras diarias")
             if isinstance(daily.index, pd.MultiIndex):
                 daily = daily.loc[symbol]
             daily = daily.sort_index()  # por si acaso; el resto del método depende del orden
@@ -260,12 +437,13 @@ class DataFetcher:
             today_utc = datetime.now(timezone.utc).date()
             fechas_utc = daily.index.date
             barras_previas = daily[fechas_utc < today_utc]
-            if barras_previas.empty:
-                return None
-            return float(barras_previas["close"].iloc[-1])
+            if not barras_previas.empty:
+                return float(barras_previas["close"].iloc[-1])
         except Exception as e:
-            logger.info(f"[{symbol}] No se pudo obtener el cierre de la sesión regular anterior: {e}")
-            return None
+            logger.info(f"[{symbol}] Alpaca no pudo dar el cierre de la sesión anterior: {e}")
+
+        # Respaldo: Tiingo (EOD gratis) si Alpaca no tenía barras diarias utilizables
+        return self.get_tiingo_previous_close(symbol)
 
     def get_premarket_change_pct(self, symbol: str):
         """
@@ -287,39 +465,88 @@ class DataFetcher:
 
     def get_relative_volume(self, symbol: str, avg_daily_volume: float = None):
         """
-        RVOL = volumen acumulado hoy / volumen promedio de los últimos 10
-        días hábiles. Ya NO depende de Yahoo Finance para el promedio:
-
-          1. Alpaca (barras DIARIAS, últimos 20 días naturales -> últimos
-             10 días hábiles) - fuente principal, sin límite de cuota extra
-             ya que usa el mismo cliente de datos que el resto del bot.
-          2. Twelve Data (respaldo) - si Alpaca no devuelve datos.
-
-        `avg_daily_volume` se acepta por compatibilidad hacia atrás pero
-        ya no se usa como fuente (antes venía de Yahoo).
+        RVOL session-aware (compatibilidad hacia atrás).
+        Equivale a get_volume_metrics(symbol)["rvol_session"].
         """
+        try:
+            metrics = self.get_volume_metrics(symbol)
+            return metrics.get("rvol_session")
+        except Exception:
+            # Fallback mínimo si get_volume_metrics falla
+            bars = self.get_bars(symbol, minutes_back=config.LOOKBACK_MINUTES_FALLBACK)
+            if bars.empty or "volume" not in bars.columns:
+                return None
+            today_volume = float(bars["volume"].sum())
+            avg_volume_10d = self._get_avg_daily_volume_alpaca(symbol)
+            if avg_volume_10d is None:
+                avg_volume_10d = self._get_avg_daily_volume_twelvedata(symbol)
+            if not avg_volume_10d or avg_volume_10d <= 0:
+                return None
+            minutes_elapsed = min(len(bars), 390)
+            expected = avg_volume_10d * (minutes_elapsed / 390)
+            if expected <= 0:
+                return None
+            return round(today_volume / expected, 2)
+
+    def get_volume_metrics(self, symbol: str) -> dict:
+        """
+        Métricas de volumen separadas (V7.2):
+
+          rvol_daily   — volumen de HOY (barra diaria) / promedio 10 días.
+                         Útil para gap & go de sesión completa.
+          rvol_session — volumen acumulado intradía / esperado a esta hora
+                         (normalizado a fracción de sesión). Mejor para scalping.
+          float_turnover — volumen acumulado hoy / float shares.
+                           Mide qué % del float ya se negoció (presión real).
+          today_volume, avg_volume_10d, float_shares (auxiliares).
+        """
+        out = {
+            "rvol_daily": None,
+            "rvol_session": None,
+            "float_turnover": None,
+            "today_volume": None,
+            "avg_volume_10d": None,
+            "float_shares": None,
+        }
+
         bars = self.get_bars(symbol, minutes_back=config.LOOKBACK_MINUTES_FALLBACK)
         if bars.empty or "volume" not in bars.columns:
-            return None
+            return out
+
         today_volume = float(bars["volume"].sum())
+        out["today_volume"] = today_volume
 
         avg_volume_10d = self._get_avg_daily_volume_alpaca(symbol)
         if avg_volume_10d is None:
             avg_volume_10d = self._get_avg_daily_volume_twelvedata(symbol)
+        out["avg_volume_10d"] = avg_volume_10d
 
-        if not avg_volume_10d or avg_volume_10d <= 0:
-            return None
+        if avg_volume_10d and avg_volume_10d > 0:
+            # RVOL diario (sin normalizar por hora): útil al cierre / full-day
+            out["rvol_daily"] = round(today_volume / avg_volume_10d, 2)
 
-        # Normalizamos el promedio diario a la fracción de sesión transcurrida
-        minutes_elapsed = min(len(bars), 390)  # sesión regular = 390 min
-        expected_volume_by_now = avg_volume_10d * (minutes_elapsed / 390)
-        if expected_volume_by_now <= 0:
-            return None
+            # RVOL session-aware: normalizado a fracción de sesión transcurrida
+            minutes_elapsed = min(len(bars), 390)
+            expected_volume_by_now = avg_volume_10d * (minutes_elapsed / 390)
+            if expected_volume_by_now > 0:
+                out["rvol_session"] = round(today_volume / expected_volume_by_now, 2)
 
-        return round(today_volume / expected_volume_by_now, 2)
+        # Float turnover
+        try:
+            fund = self.get_fundamentals(symbol)
+            float_shares = fund.get("float_shares") if fund else None
+            out["float_shares"] = float_shares
+            if float_shares and float_shares > 0:
+                out["float_turnover"] = round(today_volume / float_shares, 4)
+        except Exception:
+            pass
+
+        return out
 
     def _get_avg_daily_volume_alpaca(self, symbol: str):
         """Fuente principal del RVOL: barras diarias de Alpaca (últimos ~10 días hábiles)."""
+        if time.time() < getattr(self, "_alpaca_disabled_until", 0):
+            return None
         try:
             end = datetime.now(timezone.utc)
             start = end - timedelta(days=20)  # 20 días naturales -> ~10-14 hábiles
@@ -345,11 +572,18 @@ class DataFetcher:
                 return None
             return float(last_10["volume"].mean())
         except Exception as e:
-            logger.warning(f"[{symbol}] RVOL vía Alpaca (barras diarias) falló: {e}")
+            msg = str(e)
+            if "too many requests" in msg.lower():
+                self._alpaca_disabled_until = time.time() + 60
+                logger.warning("Alpaca rate limit — RVOL pausado 60s")
+            else:
+                logger.warning(f"[{symbol}] RVOL vía Alpaca (barras diarias) falló: {e}")
             return None
 
     def _get_avg_daily_volume_twelvedata(self, symbol: str):
         """Respaldo del RVOL: Twelve Data, si Alpaca no devolvió nada."""
+        if getattr(config, "FAST_SCREENING", False):
+            return None
         if not config.TWELVE_DATA_API_KEY:
             return None
         try:
@@ -455,7 +689,8 @@ class DataFetcher:
             from finvizfinance.quote import finvizfinance as FinvizQuote
             from finvizfinance.util import number_convert
 
-            time.sleep(0.3)  # pequeña pausa, buen ciudadano con el sitio
+            if not getattr(config, "FAST_SCREENING", False):
+                time.sleep(0.3)  # en Rápido se omite (paralelismo controlado)
             stock = FinvizQuote(symbol)
             if not stock.flag:
                 logger.info(f"[{symbol}] Finviz no encontró este ticker.")
@@ -571,12 +806,28 @@ class DataFetcher:
             if market_cap is None:
                 market_cap = av_data.get("market_cap")
 
+        # Respaldos adicionales (gratis): Massive y Tiingo, antes de llegar a Yahoo
+        if shares_outstanding is None or market_cap is None:
+            massive_data = self.get_massive_reference_data(symbol)
+            if shares_outstanding is None:
+                shares_outstanding = massive_data.get("shares_outstanding")
+            if market_cap is None:
+                market_cap = massive_data.get("market_cap")
+
+        if shares_outstanding is None or market_cap is None:
+            tiingo_data = self.get_tiingo_fundamentals(symbol)
+            if shares_outstanding is None:
+                shares_outstanding = tiingo_data.get("shares_outstanding")
+            if market_cap is None:
+                market_cap = tiingo_data.get("market_cap")
+
         info = {}
         still_missing = float_shares is None or shares_outstanding is None or market_cap is None
         yahoo_cooling_down = time.time() < self._yahoo_disabled_until
 
         if still_missing and not yahoo_cooling_down:
-            time.sleep(0.6)  # pequeña pausa preventiva: reduce la chance de disparar el 429 desde el 1er ticker
+            if not getattr(config, "FAST_SCREENING", False):
+                time.sleep(0.6)  # omitido en Rápido
             try:
                 ticker = yf.Ticker(symbol)
                 info = ticker.info or {}
@@ -734,6 +985,10 @@ class DataFetcher:
         return today_ny
 
     def _get_session_volume_twelvedata(self, symbol: str, start_hms: str, end_hms: str, session_label: str):
+        # FAST_SCREENING hard skip TD session
+        if getattr(config, "FAST_SCREENING", False):
+            return None
+
         """
         Helper compartido: suma el volumen de Twelve Data entre `start_hms`
         y `end_hms` (hora NY) del último día hábil. Usado tanto por
@@ -762,7 +1017,8 @@ class DataFetcher:
             # nada para after-hours específicamente, incluso con el
             # parámetro — eso sería una limitación real del plan, no un
             # bug de este código.
-            time.sleep(0.3)  # buen ciudadano: no ráfaga contra el límite por minuto
+            if not getattr(config, "FAST_SCREENING", False):
+                time.sleep(0.3)
             resp = requests.get(url, timeout=10)
             data = resp.json()
 
@@ -771,7 +1027,7 @@ class DataFetcher:
                 msg_lower = msg.lower()
                 logger.info(f"[{symbol}] Twelve Data ({session_label}): {msg}")
                 if "run out of api credits" in msg_lower or "limit" in msg_lower:
-                    self._twelvedata_disabled_until = time.time() + 60
+                    self._twelvedata_disabled_until = time.time() + 120  # 2 min: menos spam, screening más rápido
                     logger.warning("Twelve Data alcanzó su límite de peticiones — se pausa 60s.")
                 return None
 
@@ -792,6 +1048,9 @@ class DataFetcher:
             return None
 
     def get_premarket_volume_twelvedata(self, symbol: str):
+        if getattr(config, "FAST_SCREENING", False):
+            return None
+
         """
         Respaldo de volumen premarket (4:00-9:30 AM hora NY) usando Twelve
         Data, para cuando Alpaca/IEX no tiene datos de esa ventana (IEX no
@@ -801,6 +1060,9 @@ class DataFetcher:
         return self._get_session_volume_twelvedata(symbol, "04:00:00", "09:30:00", "premarket")
 
     def get_afterhours_volume_twelvedata(self, symbol: str):
+        if getattr(config, "FAST_SCREENING", False):
+            return None
+
         """
         Respaldo de volumen after-hours (4:00-8:00 PM hora NY) usando
         Twelve Data — mismo problema estructural que premarket: IEX

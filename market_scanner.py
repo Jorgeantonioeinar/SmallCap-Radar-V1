@@ -5,11 +5,10 @@ Escáner automático del Top 30 de small caps con mayor Momentum, Gap % y
 Spike de volumen del día, SIN necesidad de escribir tickers a mano.
 
 Cadena de redundancia:
-  1. TradingView Scanner API (endpoint público no oficial, gratis, sin
-     necesidad de clave) - fuente principal, muy rápida y confiable.
-  2. Finviz (vía la librería `finvizfinance`) - respaldo si TradingView
-     falla o devuelve una lista vacía.
-  3. Si ambas fallan: lista vacía [] (nunca revienta el bot).
+  0. IBKR TWS Scanner (solo PC local con TWS paper abierto e IBKR_FORCE=true)
+  1. TradingView Scanner API (gratis) — principal en nube / sin TWS
+  2. Finviz (finvizfinance) — respaldo
+  3. Si todo falla: lista vacía [] (nunca revienta el bot).
 
 El resultado siempre se devuelve en el mismo formato que espera
 screener.rank_candidates(): una lista de dicts
@@ -27,12 +26,44 @@ logger = logging.getLogger("market_scanner")
 
 
 def get_top30_gappers_spikes():
-    """Punto de entrada único: intenta TradingView, si falla cae a Finviz."""
+    """
+    Punto de entrada único del scanner automático.
+
+    En PC con TWS paper (IBKR_FORCE=true): intenta primero el scanner nativo IBKR.
+    En nube o sin TWS: TradingView → Finviz.
+    """
+    # 0) IBKR solo en entorno local con TWS
+    results = _get_top30_ibkr()
+    if results:
+        return results[:30]
+
     results = _get_top30_tradingview()
     if not results:
         logger.info("TradingView no devolvió resultados, probando con Finviz...")
         results = _get_top30_finviz()
     return results[:30]
+
+
+def _get_top30_ibkr():
+    """Scanner TOP_PERC_GAIN de IBKR TWS. Vacío si TWS off o nube."""
+    try:
+        from market_data_manager import get_market_data_manager, is_local_tws_environment
+        if not is_local_tws_environment():
+            return []
+        mdm = get_market_data_manager()
+        if mdm.active_name != "ibkr":
+            return []
+        price_min = float(getattr(config, "SCANNER_PRICE_MIN", 0.5))
+        price_max = float(getattr(config, "SCANNER_PRICE_MAX", 20.0))
+        symbols = mdm.scan_gainers(price_min=price_min, price_max=price_max, limit=30)
+        if not symbols:
+            logger.info("IBKR scanner activo pero sin símbolos; se usa TradingView.")
+            return []
+        logger.info(f"IBKR TWS scanner devolvió {len(symbols)} candidatos (primario local).")
+        return _to_universe_format(symbols)
+    except Exception as e:
+        logger.debug(f"IBKR scanner no usado: {e}")
+        return []
 
 
 def _to_universe_format(symbols):
