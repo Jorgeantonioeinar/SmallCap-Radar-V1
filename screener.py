@@ -10,6 +10,7 @@ screener.py
 
 import logging
 import os
+from dataclasses import replace
 
 import numpy as np
 import pandas as pd
@@ -524,15 +525,19 @@ def score_candidate(
     symbol: str, fetcher: DataFetcher, float_override=None, rvol_override=None,
     gap_override=None, price_override=None, market_cap_override=None,
     volume_override=None, premarket_volume_override=None, afterhours_volume_override=None,
+    price_session_override=None,
 ):
     """Despachador: usa el motor clásico o el TitonSmartEngine según config.SCORING_ENGINE."""
     if config.SCORING_ENGINE == "smart":
         return score_candidate_smart(
             symbol, fetcher, float_override, rvol_override, gap_override, price_override,
             market_cap_override, volume_override, premarket_volume_override, afterhours_volume_override,
+            price_session_override,
         )
     return _score_candidate_classic(
-        symbol, fetcher, float_override, rvol_override, gap_override, price_override
+        symbol, fetcher, float_override, rvol_override, gap_override, price_override,
+        volume_override, premarket_volume_override, afterhours_volume_override,
+        price_session_override,
     )
 
 
@@ -540,6 +545,7 @@ def score_candidate_smart(
     symbol: str, fetcher: DataFetcher, float_override=None, rvol_override=None,
     gap_override=None, price_override=None, market_cap_override=None,
     volume_override=None, premarket_volume_override=None, afterhours_volume_override=None,
+    price_session_override=None,
 ):
     """
     Arma el diccionario de datos que espera TitonSmartEngine.evaluate()
@@ -547,8 +553,21 @@ def score_candidate_smart(
     del dashboard (mismas claves que la función clásica), para que la
     tabla/gráficos/compra funcionen sin cambios.
     """
-    price = fetcher.get_latest_price(symbol)
-    used_price_override = (price is None or price <= 0) and price_override is not None and price_override > 0
+    try:
+        from strategy import get_current_session
+        current_session = get_current_session()
+    except Exception:
+        current_session = "regular"
+    use_session_price = (
+        price_override is not None and price_override > 0
+        and price_session_override == current_session
+        and current_session in ("premarket", "regular", "afterhours")
+    )
+    price = price_override if use_session_price else fetcher.get_latest_price(symbol)
+    used_price_override = (
+        not use_session_price and (price is None or price <= 0)
+        and price_override is not None and price_override > 0
+    )
     if used_price_override:
         price = price_override
     fundamentals = fetcher.get_fundamentals(symbol)
@@ -593,10 +612,9 @@ def score_candidate_smart(
     elif not premarket_volume and not getattr(config, "FAST_SCREENING", False):
         premarket_volume = fetcher.get_premarket_volume_twelvedata(symbol)
 
-    # Volumen after-hours (4:00-8:00pm hora NY): mismo hueco estructural
-    # que premarket (IEX tampoco opera en after-hours), mismo respaldo.
-    # Por ahora solo se EXPONE el dato (no se usa todavía en el scoring
-    # del Motor Smart) — la Pieza 3 lo incorporará al perfil de "Sesión".
+    # Volumen after-hours (4:00-8:00pm hora NY): misma ventana estructural
+    # que premarket. El volumen importado de Moomoo tiene prioridad; el
+    # respaldo de barras/feed se conserva cuando el archivo no trae ese dato.
     afterhours_volume = None
     try:
         from strategy import NY_TZ
@@ -626,8 +644,6 @@ def score_candidate_smart(
     # normal (bars["volume"].sum()); en premarket/after-hours, el volumen de
     # esa ventana específica. El float no cambia según la hora, así que la
     # misma fórmula (session_volume / float) es válida en las 3 sesiones.
-    from strategy import get_current_session
-    current_session = get_current_session()
     if current_session == "premarket":
         session_volume = (
             premarket_volume_override
@@ -657,9 +673,17 @@ def score_candidate_smart(
         "sec_dilution_blocked": dilution["blocked"],
         "gap_pct": gap_override,
     }
-    verdict = _smart_engine.evaluate(data)
+    session_profile = config.get_session_scoring_profile(current_session)
+    smart_cfg = replace(
+        _smart_engine.cfg,
+        price_min=float(getattr(config, "PRICE_MIN", _smart_engine.cfg.price_min)),
+        price_max=float(getattr(config, "PRICE_MAX", _smart_engine.cfg.price_max)),
+        gap_min_pct=float(session_profile.get("gap_min_pct", config.GAP_MIN_PCT)),
+        approval_threshold=float(getattr(config, "SCORE_MIN_TO_BUY", _smart_engine.cfg.approval_threshold)),
+    )
+    verdict = TitonSmartEngine(smart_cfg).evaluate(data)
 
-    # RVOL Estructural (premarket_volume / float) — antes esta columna mostraba
+    # RVOL Estructural (session_volume / float) — antes esta columna mostraba
     # siempre "rvol_override" (None salvo entrada manual), aunque el motor Smart
     # SÍ calcula esta relación internamente para el score. Ahora se expone el
     # mismo número que ya usa el motor, como un múltiplo "x" comparable al RVOL
@@ -667,10 +691,12 @@ def score_candidate_smart(
     # que los dos "RVOL" miden cosas relacionadas pero no idénticas — ver nota
     # en el dashboard/README).
     structural_rvol = None
-    if rvol_override is not None:
+    if session_volume and float_shares and float_shares > 0:
+        structural_rvol = round(session_volume / float_shares, 2)
+    elif rvol_override is not None:
+        # Solo se conserva como contexto si falta el float para calcular la
+        # misma relación sesión/float que el motor Smart puntúa.
         structural_rvol = rvol_override
-    elif premarket_volume and float_shares:
-        structural_rvol = round(premarket_volume / float_shares, 2)
 
     # Métricas de volumen separadas (V7.2) — con fallback si el método no existe
     vol_metrics = {}
@@ -687,8 +713,8 @@ def score_candidate_smart(
     rvol_daily = vol_metrics.get("rvol_daily")
     rvol_session = vol_metrics.get("rvol_session")
     float_turnover = vol_metrics.get("float_turnover")
-    if float_turnover is None and premarket_volume and float_shares:
-        float_turnover = round(premarket_volume / float_shares, 4)
+    if float_turnover is None and session_volume and float_shares:
+        float_turnover = round(session_volume / float_shares, 4)
 
     # --- Entry Score / Chase Status (separado del Quality Score de arriba) ---
     # "score" (verdict["score"]) responde "¿qué tan bueno es este candidato?"
@@ -707,6 +733,8 @@ def score_candidate_smart(
         "price": price,
         "gap_pct": verdict["gap_pct"],
         "rvol": structural_rvol,
+        "session_volume": session_volume,
+        "volume_score_basis": "volumen de sesión / float" if session_volume and float_shares else None,
         "rvol_daily": rvol_daily,
         "rvol_session": rvol_session,
         "float_turnover": float_turnover,
@@ -720,9 +748,16 @@ def score_candidate_smart(
         "entry_score": entry_score,
         "chase_status": chase_status,
         "signal": signal_map.get(verdict["signal"], "DESCARTAR"),
+        "score_profile": str(getattr(config, "EXIT_MODE", "scalping")).upper(),
+        "score_components": verdict.get("score_components", verdict.get("breakdown", {})),
+        "gap_score": verdict.get("score_components", {}).get("gap"),
+        "volume_score": verdict.get("score_components", {}).get("volume"),
         "notes": verdict["reasons"]
         + ([f"Gap desde Moomoo/import ({gap_override}%)"] if gap_override is not None else [])
+        + ([f"Precio de Moomoo usado para sesión {current_session}"] if use_session_price else [])
         + (["Precio de respaldo desde Moomoo/import"] if used_price_override else [])
+        + ([f"Precio de Moomoo ({price_session_override}) no aplicado; sesión actual {current_session}"]
+           if price_override is not None and price_session_override and price_session_override != current_session else [])
         + ([f"Float Market Cap: ${verdict['float_market_cap']:,.0f}"] if verdict.get("float_market_cap") else []),
     }
     return _finalize_candidate(result, bars=bars, pmh=pmh)
@@ -730,7 +765,9 @@ def score_candidate_smart(
 
 def _score_candidate_classic(
     symbol: str, fetcher: DataFetcher, float_override=None, rvol_override=None,
-    gap_override=None, price_override=None,
+    gap_override=None, price_override=None, volume_override=None,
+    premarket_volume_override=None, afterhours_volume_override=None,
+    price_session_override=None,
 ):
     """
     Calcula todas las métricas de un ticker y devuelve un diccionario con
@@ -740,11 +777,8 @@ def _score_candidate_classic(
     tienen PRIORIDAD sobre lo que devuelvan Yahoo Finance/Alpaca — así el
     bot sigue funcionando aunque Yahoo esté bloqueando peticiones.
 
-    Ponderación (10 puntos en total):
-      - Gap / Momentum del día ............ hasta 3.0 pts
-      - RVOL (volumen relativo) ............ hasta 3.0 pts
-      - Float bajo .......................... hasta 2.5 pts
-      - RSI en zona saludable (no sobrecomprado extremo) .. hasta 1.5 pts
+    Ponderación (10 puntos en total, dependiente del perfil): en scalping
+    Gap y RVOL representan 7 puntos; en swing se conserva la fórmula anterior.
       Penalizaciones: precio fuera de rango, RSI > 90 (riesgo de "backside"),
       falta de datos críticos.
     """
@@ -753,6 +787,7 @@ def _score_candidate_classic(
         "price": None,
         "gap_pct": None,
         "rvol": None,
+        "session_volume": None,
         "float_shares": None,
         "rsi": None,
         "atr": None,
@@ -761,14 +796,51 @@ def _score_candidate_classic(
         "score": 0.0,
         "signal": "DESCARTAR",
         "notes": [],
+        "score_profile": str(getattr(config, "EXIT_MODE", "swing")).upper(),
+        "score_components": {"gap": 0.0, "volume": 0.0, "float": 0.0, "rsi": 0.0},
+        "gap_score": 0.0,
+        "volume_score": 0.0,
     }
 
-    price = fetcher.get_latest_price(symbol)
-    if (price is None or price <= 0) and price_override is not None and price_override > 0:
+    try:
+        from strategy import get_current_session
+        current_session = get_current_session()
+    except Exception:
+        current_session = "regular"
+    use_session_price = (
+        price_override is not None and price_override > 0
+        and price_session_override == current_session
+        and current_session in ("premarket", "regular", "afterhours")
+    )
+    price = price_override if use_session_price else fetcher.get_latest_price(symbol)
+    if use_session_price:
+        result["notes"].append(f"Precio de Moomoo usado para sesión {current_session}")
+    elif price_override is not None and price_override > 0 and price_session_override and price_session_override != current_session:
+        result["notes"].append(
+            f"Precio Moomoo de {price_session_override} no aplicado; sesión actual {current_session}"
+        )
+    if not use_session_price and (price is None or price <= 0) and price_override is not None and price_override > 0:
         price = price_override
         result["notes"].append("Precio de respaldo desde Moomoo/import")
     fundamentals = fetcher.get_fundamentals(symbol)
     bars = fetcher.get_bars(symbol, minutes_back=config.LOOKBACK_MINUTES_FALLBACK)
+
+    # El importador ya separó las columnas por encabezado. En sesión extendida
+    # preferimos el volumen dedicado; si no existe, usamos el Volume genérico
+    # del reporte. En regular también aceptamos el Volume de Moomoo.
+    if current_session == "premarket":
+        session_volume = premarket_volume_override if premarket_volume_override is not None else volume_override
+    elif current_session == "afterhours":
+        session_volume = afterhours_volume_override if afterhours_volume_override is not None else volume_override
+    else:
+        session_volume = volume_override
+    try:
+        session_volume = float(session_volume) if session_volume is not None else None
+    except (TypeError, ValueError):
+        session_volume = None
+    if session_volume is not None and session_volume < 0:
+        session_volume = None
+    result["session_volume"] = session_volume
 
     result["price"] = price
     result["float_shares"] = float_override if float_override is not None else fundamentals.get("float_shares")
@@ -788,6 +860,7 @@ def _score_candidate_classic(
         return _finalize_candidate(result, bars=bars)
 
     score = 0.0
+    _weights = config.get_active_classic_scoring_weights()
 
     # --- 1) Gap / momentum del día (umbral según sesión: PM / regular / AH) ---
     # Prioridad: dato del CSV Moomoo/Webull (gap_override) > API Alpaca
@@ -812,8 +885,11 @@ def _score_candidate_classic(
     if gap_pct is not None:
         if gap_pct >= _gap_min:
             # Escala relativa al umbral de sesión
-            gap_score = min(3.0, 1.0 + (gap_pct - _gap_min) / 20.0)
+            _gap_base = min(3.0, 1.0 + (gap_pct - _gap_min) / 20.0)
+            gap_score = _gap_base * (_weights["gap"] / 3.0)
             score += gap_score
+            result["score_components"]["gap"] = round(gap_score, 2)
+            result["gap_score"] = round(gap_score, 2)
         else:
             result["notes"].append(f"Gap insuficiente ({gap_pct}% < {_gap_min}% [{_scoring_sess}])")
 
@@ -833,23 +909,89 @@ def _score_candidate_classic(
     result["float_turnover"] = vol_metrics.get("float_turnover")
 
     if rvol_override is not None:
-        rvol = rvol_override
-        result["notes"].append("RVOL puesto a mano (override manual)")
+        try:
+            rvol = float(rvol_override)
+        except (TypeError, ValueError):
+            rvol = None
+        result["notes"].append("RVOL importado desde Moomoo/manual")
     else:
-        # Preferimos session-aware para scalping; si no hay, daily
-        rvol = vol_metrics.get("rvol_session") or vol_metrics.get("rvol_daily")
-        if rvol is None and hasattr(fetcher, "get_relative_volume"):
+        # Preferimos session-aware para scalping; si no hay, daily.
+        rvol = vol_metrics.get("rvol_session")
+        if rvol is None or rvol <= 0:
+            rvol = vol_metrics.get("rvol_daily")
+        if (rvol is None or rvol <= 0) and hasattr(fetcher, "get_relative_volume"):
             try:
                 rvol = fetcher.get_relative_volume(symbol)
             except Exception:
                 rvol = None
     result["rvol"] = rvol
-    if rvol is not None:
-        if rvol >= config.RVOL_MIN:
-            rvol_score = min(3.0, (rvol / config.RVOL_MIN) * 1.5)
-            score += rvol_score
-        else:
-            result["notes"].append(f"RVOL bajo ({rvol}x < {config.RVOL_MIN}x)")
+
+    try:
+        session_rvol_min = float(
+            config.get_session_scoring_profile(_scoring_sess).get("rvol_min", config.RVOL_MIN)
+        )
+    except Exception:
+        session_rvol_min = float(config.RVOL_MIN)
+
+    score_rvol = (
+        rvol if rvol_override is not None and rvol is not None and rvol > 0 else None
+    )
+    float_shares_for_volume = result.get("float_shares")
+    has_session_float = (
+        session_volume is not None and session_volume > 0
+        and float_shares_for_volume is not None and float_shares_for_volume > 0
+    )
+    if (score_rvol is None or score_rvol < session_rvol_min) and has_session_float:
+        # El RVOL es la base principal. Si falta o queda bajo el mínimo de
+        # esta sesión, el volumen/float del mismo reporte puede reemplazarlo;
+        # nunca sumamos ambos componentes ni fingimos que son la misma métrica.
+        full_turnover = float(getattr(config, "SCALPING_VOLUME_FLOAT_TURNOVER_FULL_SCORE", 0.50) or 0.50)
+        turnover_ratio = session_volume / float_shares_for_volume
+        volume_fraction = min(1.0, turnover_ratio / full_turnover) if full_turnover > 0 else 0.0
+        volume_score = _weights["rvol"] * volume_fraction
+        score += volume_score
+        result["score_components"]["volume"] = round(volume_score, 2)
+        result["volume_score"] = round(volume_score, 2)
+        result["volume_score_basis"] = "volumen de sesión / float"
+        if score_rvol is not None and score_rvol < session_rvol_min:
+            result["notes"].append(
+                f"Vol Ratio bajo ({score_rvol}x < {session_rvol_min}x [{_scoring_sess}]); "
+                "se usa sesión/float como alternativa"
+            )
+        result["notes"].append(
+            f"Volumen puntuado por sesión/float ({session_volume:,.0f}/{float_shares_for_volume:,.0f}; "
+            f"turnover {turnover_ratio:.1%})"
+        )
+    else:
+        # Si el reporte trae un Vol Ratio positivo, se prefiere directamente.
+        # Si trae 0/N/D y falta float para normalizar Volume, usamos el RVOL de
+        # la fuente en vivo como respaldo (sin reemplazar el valor importado mostrado).
+        if score_rvol is None:
+            if rvol_override is None and rvol is not None and rvol > 0:
+                score_rvol = rvol
+            else:
+                live_rvol = vol_metrics.get("rvol_session")
+                if live_rvol is None or live_rvol <= 0:
+                    live_rvol = vol_metrics.get("rvol_daily")
+                if live_rvol is not None and live_rvol > 0:
+                    score_rvol = live_rvol
+                    result["notes"].append("Puntos de volumen por RVOL de respaldo")
+
+        if score_rvol is not None:
+            if score_rvol >= session_rvol_min:
+                _rvol_base = min(3.0, (score_rvol / session_rvol_min) * 1.5)
+                rvol_score = _rvol_base * (_weights["rvol"] / 3.0)
+                score += rvol_score
+                result["score_components"]["volume"] = round(rvol_score, 2)
+                result["volume_score"] = round(rvol_score, 2)
+                result["volume_score_basis"] = "RVOL"
+            else:
+                result["notes"].append(f"RVOL bajo ({score_rvol}x < {session_rvol_min}x [{_scoring_sess}])")
+        elif rvol is not None:
+            _rvol_source = "importado" if rvol_override is not None else "disponible"
+            result["notes"].append(
+                f"RVOL {_rvol_source} no positivo ({rvol}x); sin float para normalizar volumen"
+            )
 
     # --- 3) Float bajo (override manual tiene prioridad) ---
     float_shares = result["float_shares"]
@@ -866,9 +1008,13 @@ def _score_candidate_classic(
         elif float_shares > config.FLOAT_MAX_SHARES:
             result["notes"].append(f"Float alto ({float_shares:,.0f} > {config.FLOAT_MAX_SHARES:,.0f})")
         elif float_shares <= config.FLOAT_LOW_BONUS_SHARES:
-            score += 2.5
+            float_score = _weights["float_low"]
+            score += float_score
+            result["score_components"]["float"] = float_score
         else:
-            score += 1.3
+            float_score = _weights["float_standard"]
+            score += float_score
+            result["score_components"]["float"] = float_score
     else:
         result["notes"].append("Float no disponible (agrégalo a mano si Yahoo Finance falla)")
 
@@ -877,12 +1023,14 @@ def _score_candidate_classic(
     result["rsi"] = rsi
     if rsi is not None:
         if config.RSI_SWEET_SPOT_LOW <= rsi <= config.RSI_SWEET_SPOT_HIGH:
-            score += 1.5
+            score += _weights["rsi"]
+            result["score_components"]["rsi"] = _weights["rsi"]
         elif rsi > config.RSI_OVERBOUGHT:
             score -= 1.0  # penalización: riesgo de comprar en el pico ("backside")
             result["notes"].append(f"RSI muy sobrecomprado ({rsi}) - riesgo de backside")
         elif rsi > config.RSI_SWEET_SPOT_HIGH:
             score += 0.7
+            result["score_components"]["rsi"] = 0.7
 
     # --- ATR (para uso posterior en el stop dinámico, no puntúa) ---
     result["atr"] = compute_atr(bars)
@@ -961,6 +1109,7 @@ def rank_candidates(fetcher: DataFetcher, tickers=None):
         if isinstance(entry, str):
             symbol, float_override, rvol_override, gap_override = entry, None, None, None
             price_override = market_cap_override = volume_override = premarket_volume_override = afterhours_volume_override = None
+            price_session_override = None
         else:
             symbol = entry["symbol"]
             float_override = entry.get("float_override")
@@ -971,11 +1120,12 @@ def rank_candidates(fetcher: DataFetcher, tickers=None):
             volume_override = entry.get("volume_override")
             premarket_volume_override = entry.get("premarket_volume_override")
             afterhours_volume_override = entry.get("afterhours_volume_override")
+            price_session_override = entry.get("price_session")
         try:
             scored = score_candidate(
                 symbol, fetcher, float_override, rvol_override, gap_override,
                 price_override, market_cap_override, volume_override, premarket_volume_override,
-                afterhours_volume_override,
+                afterhours_volume_override, price_session_override,
             )
             if not isinstance(entry, str) and entry.get("momo_data"):
                 scored["momo_data"] = entry["momo_data"]

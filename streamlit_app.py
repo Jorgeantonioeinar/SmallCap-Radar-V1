@@ -410,7 +410,7 @@ def render_ranking_table(ranked_list, title=None, key_suffix=""):
         df["rvol_display"] = df.get("rvol")
 
     cols = [
-        "symbol", "price", "gap_pct", "rvol_display", "float_shares", "rsi",
+        "symbol", "price", "gap_pct", "gap_score", "rvol_display", "volume_score", "float_shares", "rsi",
         "score", "entry_score", "chase_status", "dilution_risk",
         "short_pressure", "data_confidence", "halted", "scoring_session", "scalp_ready", "signal",
     ]
@@ -425,7 +425,9 @@ def render_ranking_table(ranked_list, title=None, key_suffix=""):
         "symbol": "Ticker",
         "price": "Precio",
         "gap_pct": "Gap %",
+        "gap_score": "Pts Gap",
         "rvol_display": "RVOL",
+        "volume_score": "Pts Vol.",
         "float_shares": "Float (M)",
         "rsi": "RSI",
         "score": "Quality",
@@ -442,7 +444,7 @@ def render_ranking_table(ranked_list, title=None, key_suffix=""):
     df_display = df_display.rename(columns={k: v for k, v in rename_map.items() if k in df_display.columns})
     # NO convertir columnas numéricas a "N/D" (rompe st.column_config.NumberColumn).
     # Solo textos: None/NaN → cadena vacía o N/D en columnas de texto.
-    _numeric_cols = {"Precio", "Gap %", "RVOL", "Float (M)", "RSI", "Quality", "Entry", "Confianza"}
+    _numeric_cols = {"Precio", "Gap %", "Pts Gap", "RVOL", "Pts Vol.", "Float (M)", "RSI", "Quality", "Entry", "Confianza"}
     _text_cols = {"Ticker", "Estado", "Dilución", "Short", "Halt", "Sesión", "Scalp", "Señal"}
     for _col in df_display.columns:
         if _col in _numeric_cols:
@@ -521,7 +523,9 @@ def render_ranking_table(ranked_list, title=None, key_suffix=""):
         column_config={
             "Precio": st.column_config.NumberColumn(format="$%.2f"),
             "Gap %": st.column_config.NumberColumn(format="%.2f%%"),
+            "Pts Gap": st.column_config.NumberColumn(format="%.2f", help="Puntos que el Gap aporta al Quality Score (máximo 3.5 en scalping)"),
             "RVOL": st.column_config.NumberColumn(format="%.2fx"),
+            "Pts Vol.": st.column_config.NumberColumn(format="%.2f", help="Puntos por RVOL o por volumen de sesión/float (máximo 3.5 en scalping)"),
             "Float (M)": st.column_config.NumberColumn(format="%.2fM"),
             "RSI": st.column_config.NumberColumn(format="%.1f"),
             "Quality": st.column_config.NumberColumn(format="%.2f", help="Qué tan bueno es el candidato"),
@@ -534,6 +538,7 @@ def render_ranking_table(ranked_list, title=None, key_suffix=""):
         "🟡 Amarillo = Quality bueno pero extendido o datos incompletos · "
         "🔴 Rojo = HALT activo (no operar) · "
         "Confianza < 70 → solo VIGILAR · "
+        "Pts Gap/Vol. = contribución individual al Quality Score · "
         "Short = % short volume FINRA (contexto) · "
         "Scalp = señal unificada LISTO / VIGILAR / NO (Quality+Entry+Halt+Confianza+horario)."
     )

@@ -72,6 +72,16 @@ Todos los parámetros (float máximo, % de gap mínimo, RVOL mínimo, % de
 riesgo por operación, niveles de take-profit, % de trailing stop, etc.)
 están centralizados en `config.py` con comentarios explicando cada uno.
 
+### Perfil de calificación para scalping
+
+Con `EXIT_MODE = "scalping"` (perfil predeterminado), el motor **Classic** asigna hasta 3.5/10 puntos al Gap y 3.5/10 al RVOL. Float y RSI conservan el resto del peso. El puntaje del Gap se limita al alcanzar el tope; un Gap cada vez más extremo no recibe puntos indefinidamente. En `swing`, se mantienen los pesos anteriores.
+
+El componente de volumen no suma dos veces la misma actividad: usa el RVOL si alcanza el mínimo de la sesión; si falta, vale cero o queda por debajo de ese umbral, puede sustituirlo por volumen de sesión / float cuando ambos datos existen. Si falta el float, no se inventa el cálculo. Classic y Smart usan los umbrales de Gap de la sesión activa; Smart también limita el precio con `PRICE_MIN`/`PRICE_MAX` del proyecto (incluye penny stocks desde $0.01). En la tabla se muestran **Pts Gap** y **Pts Vol.** para ver su contribución al Quality Score.
+
+El precio de Moomoo de premarket, regular o after-hours se utiliza para puntuar cuando coincide con la sesión activa. Si el archivo corresponde a otra sesión, se conserva la cotización en vivo; el diagnóstico lo indica y el precio importado queda como respaldo solo si no hay cotización válida.
+
+La calificación es un filtro de candidatos, no una orden ni una probabilidad de ganancia. Se mantienen separados los controles de entrada (Entry/Chase), halt, dilución y calidad de datos; antes de usar dinero real, comparar resultados en paper trading y medir fills, spread, deslizamiento y falsas rupturas.
+
 ## 6. Subirlo a GitHub y ponerlo a correr
 
 ### 6.1 Crear el repositorio y subir el código

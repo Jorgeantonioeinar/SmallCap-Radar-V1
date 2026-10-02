@@ -233,6 +233,38 @@ SCORE_MIN_TO_BUY = 9.0       # a partir de esta calificación (escala 1-10) se
 TOP_N_CANDIDATOS = 20         # ranking automático; watchlist manual muestra TODOS
 # _RANK_LIMIT_OVERRIDE se setea en runtime (0 = todos)
 
+# Perfiles de puntos del motor Classic. En scalping Gap y RVOL suman 7/10
+# puntos posibles; el Gap se satura para no premiar indefinidamente un movimiento
+# ya extendido. Swing conserva la ponderación anterior (Gap+RVOL = 6/10).
+CLASSIC_SCORING_WEIGHTS = {
+    "scalping": {
+        "gap": 3.5,
+        "rvol": 3.5,
+        "float_low": 1.5,
+        "float_standard": 0.8,
+        "rsi": 1.5,
+    },
+    "swing": {
+        "gap": 3.0,
+        "rvol": 3.0,
+        "float_low": 2.5,
+        "float_standard": 1.3,
+        "rsi": 1.5,
+    },
+}
+
+
+def get_active_classic_scoring_weights() -> dict:
+    """Devuelve una copia de los pesos asociados al perfil EXIT_MODE activo."""
+    mode = str(globals().get("EXIT_MODE", "swing")).lower()
+    return dict(CLASSIC_SCORING_WEIGHTS.get(mode, CLASSIC_SCORING_WEIGHTS["swing"]))
+
+
+# Si Moomoo no proporciona un Vol Ratio útil (ausente, cero o bajo el mínimo
+# de su sesión), el volumen de esa sesión / float puede sustituirlo sin sumarse
+# al RVOL. El componente se completa al alcanzar 50% del float.
+SCALPING_VOLUME_FLOAT_TURNOVER_FULL_SCORE = 0.50
+
 
 
 # ---------------------------------------------------------------------------

@@ -29,7 +29,8 @@ from dataclasses import dataclass
 @dataclass
 class TitonSmartEngineConfig:
     # --- Filtros duros (luz roja = rechazo automático, score 0.0) ---
-    price_min: float = 1.00
+    price_min: float = 0.01
+    price_max: float = 30.0
     gap_min_pct: float = 10.0
 
     # --- Market Cap: banda óptima de micro/small cap ---
@@ -49,11 +50,14 @@ class TitonSmartEngineConfig:
     approval_threshold: float = 9.0
 
     # --- Pesos de cada componente (deben sumar 10.0) ---
-    weight_market_cap: float = 2.0
-    weight_float_turnover: float = 1.0
-    weight_catalyst_gap: float = 3.0
-    weight_structural_rvol: float = 2.5
-    weight_price_structure: float = 1.5
+    # Scalping: Gap (3.6) + sesión/RVOL estructural (3.5) = 7.1/10.
+    # El catalizador conserva 0.9 pts; market cap, float y precio suman 2.0.
+    weight_market_cap: float = 1.0
+    weight_float_turnover: float = 0.5
+    weight_catalyst_gap: float = 4.5
+    weight_structural_rvol: float = 3.5
+    weight_price_structure: float = 0.5
+    gap_share_of_catalyst_gap: float = 0.8
 
 
 class TitonSmartEngine:
@@ -140,7 +144,7 @@ class TitonSmartEngine:
         fraction = (ratio - zero_at) / (full_at - zero_at)
         return round(self.cfg.weight_float_turnover * fraction, 3)
 
-    def _score_catalyst_and_gap(self, gap_pct: float, catalyst_verified) -> float:
+    def _score_gap_and_catalyst_components(self, gap_pct: float, catalyst_verified) -> tuple[float, float]:
         """
         Combina la fuerza del gap (movimiento % frente al cierre anterior)
         con la confirmación de que existe un catalizador real detrás
@@ -148,8 +152,8 @@ class TitonSmartEngine:
         suele ser ruido o manipulación de corto plazo, mientras que un
         catalizador real sostiene el movimiento durante más tiempo.
         """
-        gap_component_max = self.cfg.weight_catalyst_gap * (2 / 3)   # 2/3 del peso total al gap
-        catalyst_component_max = self.cfg.weight_catalyst_gap * (1 / 3)  # 1/3 al catalizador
+        gap_component_max = self.cfg.weight_catalyst_gap * self.cfg.gap_share_of_catalyst_gap
+        catalyst_component_max = self.cfg.weight_catalyst_gap * (1.0 - self.cfg.gap_share_of_catalyst_gap)
 
         gap_score = 0.0
         if gap_pct and gap_pct >= self.cfg.gap_min_pct:
@@ -159,6 +163,11 @@ class TitonSmartEngine:
 
         catalyst_score = catalyst_component_max if catalyst_verified else 0.0
 
+        return round(gap_score, 3), round(catalyst_score, 3)
+
+    def _score_catalyst_and_gap(self, gap_pct: float, catalyst_verified) -> float:
+        """Compatibilidad con llamadores anteriores que esperan un solo subtotal."""
+        gap_score, catalyst_score = self._score_gap_and_catalyst_components(gap_pct, catalyst_verified)
         return round(gap_score + catalyst_score, 3)
 
     def _score_structural_rvol(self, session_volume: float, float_shares: float) -> float:
@@ -235,6 +244,9 @@ class TitonSmartEngine:
         if not price or price < self.cfg.price_min:
             result["reasons"].append(f"Precio por debajo del piso mínimo (${self.cfg.price_min})")
             return result
+        if price > self.cfg.price_max:
+            result["reasons"].append(f"Precio por encima del techo máximo (${self.cfg.price_max})")
+            return result
         if sec_dilution_blocked:
             result["reasons"].append("Bloqueado por SEC Shield: oferta de dilución activa detectada")
             return result
@@ -245,16 +257,26 @@ class TitonSmartEngine:
             return result
 
         # --- LUZ VERDE: calcular el score ponderado ---
+        gap_component, catalyst_component = self._score_gap_and_catalyst_components(gap_pct, catalyst_verified)
+        structural_rvol_component = self._score_structural_rvol(session_volume, float_shares)
         breakdown = {
             "market_cap_band": self._score_market_cap_band(market_cap),
             "float_turnover_ratio": self._score_float_turnover_ratio(float_shares, shares_outstanding),
-            "catalyst_and_gap": self._score_catalyst_and_gap(gap_pct, catalyst_verified),
-            "structural_rvol": self._score_structural_rvol(session_volume, float_shares),
+            "catalyst_and_gap": round(gap_component + catalyst_component, 3),
+            "structural_rvol": structural_rvol_component,
             "price_structure": self._score_price_structure(price),
         }
         total_score = round(sum(breakdown.values()), 2)
 
         result["breakdown"] = breakdown
+        result["score_components"] = {
+            "gap": gap_component,
+            "catalyst": catalyst_component,
+            "volume": structural_rvol_component,
+            "market_cap": breakdown["market_cap_band"],
+            "float": breakdown["float_turnover_ratio"],
+            "price": breakdown["price_structure"],
+        }
         result["score"] = total_score
         result["signal"] = (
             "Single-Bullet Aprobado" if total_score >= self.cfg.approval_threshold else "EN OBSERVACIÓN"

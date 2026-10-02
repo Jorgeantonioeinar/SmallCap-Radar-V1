@@ -49,6 +49,13 @@ def _is_ticker(t: str) -> bool:
     return bool(t and 2 <= len(t) <= 5 and t not in _STOP and t.isalpha())
 
 
+def _is_explicit_symbol(value: str) -> bool:
+    """Un símbolo en la columna Symbol es dato explícito, no prosa a filtrar."""
+    token = str(value or "").strip().upper().split()[0] if str(value or "").strip() else ""
+    token = token.rsplit(":", 1)[-1].lstrip("$")
+    return bool(re.fullmatch(r"[A-Z]{1,5}", token))
+
+
 def extract_tickers(text: str, max_n: int = 80) -> List[str]:
     if not text or not str(text).strip():
         return []
@@ -139,7 +146,11 @@ _PRE_GAP_HEADERS = (
 _GAP_HEADERS = ("percent change", "change percent", "chg pct", "change %", "% change", "% chg", "chg%")
 _RVOL_HEADERS = ("vol ratio", "volume ratio", "rvol", "rel volume", "relative volume")
 _PRE_PRICE_HEADERS = ("pre mkt stock price", "pre mkt price", "pre market price", "premarket price", "pre-market price")
-_AFTER_PRICE_HEADERS = ("after hours price", "afterhour price", "post mkt price", "post market price", "postmarket price", "ah price")
+_AFTER_PRICE_HEADERS = (
+    "after hours stock price", "afterhour stock price", "post mkt stock price",
+    "post market stock price", "postmarket stock price", "after hours price",
+    "afterhour price", "post mkt price", "post market price", "postmarket price", "ah price",
+)
 _PRICE_HEADERS = ("last price", "last", "price", "close")
 _FLOAT_HEADERS = ("float shares", "shares float", "free float", "float")
 _PRE_VOL_HEADERS = ("pre mkt volume", "pre mkt vol", "premarket volume", "pre-market volume", "pre market volume")
@@ -270,10 +281,9 @@ def _entries_from_rows(headers, rows, max_n: int = 80) -> list:
     out, seen = [], set()
     for row in rows:
         raw_symbol = row.get(symbol_key)
-        if raw_symbol is None:
-            continue
-        token = _clean_token(str(raw_symbol).strip().split()[0])
-        if not _is_ticker(token) or token in seen:
+        raw_token = str(raw_symbol or "").strip().split()[0] if str(raw_symbol or "").strip() else ""
+        token = raw_token.rsplit(":", 1)[-1].lstrip("$").upper()
+        if not _is_explicit_symbol(token) or token in seen:
             continue
         seen.add(token)
 
@@ -309,20 +319,35 @@ def _entries_from_rows(headers, rows, max_n: int = 80) -> list:
 
         # These are the columns currently consumed by the scoring formulas.
         entry = {"symbol": token, "momo_data": momo}
-        selected_gap = next((momo.get(key) for key in (
-            "afterhours_change_pct", "premarket_change_pct", "change_pct"
-        ) if momo.get(key) is not None), None)
+        selected_price_field = next(((key, session) for key, session in (
+            ("afterhours_price", "afterhours"),
+            ("premarket_price", "premarket"),
+            ("price", "regular"),
+        ) if momo.get(key) is not None and momo.get(key) > 0), None)
+        if selected_price_field is not None:
+            price_key, price_session = selected_price_field
+            entry["price_hint"] = momo[price_key]
+            entry["price_session"] = price_session
+
+        # Prefer session-specific percent change. If it is absent but that
+        # session has a price and previous close, derive its own Gap before
+        # falling back to regular-session % Chg.
+        selected_gap = momo.get("afterhours_change_pct")
+        if selected_gap is None and momo.get("afterhours_price") and momo.get("prev_close", 0) > 0:
+            selected_gap = (momo["afterhours_price"] - momo["prev_close"]) / momo["prev_close"] * 100.0
+        if selected_gap is None:
+            selected_gap = momo.get("premarket_change_pct")
+        if selected_gap is None and momo.get("premarket_price") and momo.get("prev_close", 0) > 0:
+            selected_gap = (momo["premarket_price"] - momo["prev_close"]) / momo["prev_close"] * 100.0
+        if selected_gap is None:
+            selected_gap = momo.get("change_pct")
+        if selected_gap is None and selected_price_field is not None and momo.get("prev_close", 0) > 0:
+            selected_price = momo[selected_price_field[0]]
+            selected_gap = (selected_price - momo["prev_close"]) / momo["prev_close"] * 100.0
         if selected_gap is not None:
             entry["gap_override"] = selected_gap
-        elif momo.get("price") and momo.get("prev_close"):
-            entry["gap_override"] = (momo["price"] - momo["prev_close"]) / momo["prev_close"] * 100.0
         if momo.get("vol_ratio") is not None:
             entry["rvol_override"] = momo["vol_ratio"]
-        selected_price = next((momo.get(key) for key in (
-            "afterhours_price", "premarket_price", "price"
-        ) if momo.get(key) is not None and momo.get(key) > 0), None)
-        if selected_price is not None and selected_price > 0:
-            entry["price_hint"] = selected_price
         if momo.get("free_float") is not None and momo["free_float"] > 1000:
             entry["float_override"] = momo["free_float"]
         if momo.get("volume") is not None and momo["volume"] >= 0:

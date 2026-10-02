@@ -55,6 +55,7 @@ class MoomooImportTests(unittest.TestCase):
         self.assertEqual(row["gap_override"], 12.5)
         self.assertEqual(row["rvol_override"], 3.2)
         self.assertEqual(row["price_hint"], 2.75)
+        self.assertEqual(row["price_session"], "premarket")
         self.assertEqual(row["float_override"], 2_300_000)
         self.assertEqual(row["premarket_volume_override"], 450_000)
         self.assertEqual(row["market_cap_override"], 28_500_000)
@@ -72,6 +73,33 @@ class MoomooImportTests(unittest.TestCase):
         self.assertEqual(row["market_cap_override"], 28_500_000)
         self.assertEqual(row["momo_data"]["afterhours_change_pct"], 8.2)
         self.assertEqual(row["momo_data"]["change_pct"], 4.0)
+
+    def test_actual_post_mkt_stock_price_header_overrides_generic_price(self):
+        csv_text = (
+            "Symbol,Price,Chg,% Chg,Mkt Cap,Volume,Post Mkt Stock Price,"
+            "Post Mkt % Chg,Vol Ratio,Prev Close\n"
+            "AGRZ,3.25,0.02,0.62%,6151191,21258,3.47,6.77%,0.03,3.23\n"
+        )
+        row = extract_rows_from_csv(csv_text.encode("utf-8"))[0]
+        self.assertEqual(row["gap_override"], 6.77)
+        self.assertEqual(row["price_hint"], 3.47)
+        self.assertEqual(row["price_session"], "afterhours")
+        self.assertEqual(row["momo_data"]["price"], 3.25)
+        self.assertEqual(row["momo_data"]["afterhours_price"], 3.47)
+        self.assertEqual(row["volume_override"], 21258)
+
+    def test_post_market_gap_derives_from_post_market_price_before_regular_percent(self):
+        csv_text = (
+            "Symbol,Price,% Chg,Post Mkt Stock Price,Prev Close\n"
+            "AGRZ,3.25,0.62%,3.47,3.23\n"
+        )
+        row = extract_rows_from_csv(csv_text.encode("utf-8"))[0]
+        self.assertAlmostEqual(row["gap_override"], (3.47 - 3.23) / 3.23 * 100.0)
+
+    def test_explicit_symbol_column_keeps_valid_common_word_and_one_letter_symbols(self):
+        csv_text = "Symbol,Price\nALL,3.20\nBIO,4.10\nA,1.25\n"
+        rows = extract_rows_from_csv(csv_text.encode("utf-8"))
+        self.assertEqual([row["symbol"] for row in rows], ["ALL", "BIO", "A"])
 
     def test_premarket_export_uses_premarket_gap_and_price_and_keeps_csv_ticker(self):
         csv_text = (
